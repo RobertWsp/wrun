@@ -1,0 +1,1118 @@
+#!/usr/bin/env python3
+"""wrun - Bash Wrapper: Optimized command output for AI consumption.
+
+Wraps any bash command, captures output, and produces a minimal
+token-efficient summary. Designed for test runners, linters, type
+checkers, and build tools.
+
+Usage:
+    wrun <command> [args...]
+    wrun --full <command> [args...]
+    wrun --json <command> [args...]
+    <command> 2>&1 | wrun --stdin [--tool pytest]
+
+Options:
+    --full              Show full output (bypass optimization)
+    --max-failures N    Max failures to display (default: 10)
+    --max-lines N       Max error lines per failure (default: 15)
+    --json              Output as JSON
+    -q, --quiet         Summary line only
+    --no-save           Don't save full output to disk
+    --stdin             Read from stdin instead of executing command
+    --tool TOOL         Hint tool type when using --stdin
+    -h, --help          Show this help
+
+Examples:
+    wrun uv run pytest -x tests/
+    wrun bun test src/
+    wrun ruff check .
+    wrun tsc --noEmit
+    wrun make build
+    pytest tests/ 2>&1 | wrun --stdin --tool pytest
+
+Shell integration (auto-wrap):
+    source ~/.local/share/wrun/integration.zsh
+    export WRUN_AUTO=1
+
+Optimization techniques:
+    - ANSI color stripping
+    - Relative path normalization (worktree-aware)
+    - Show only failures (skip passing tests)
+    - Truncate stack traces (skip framework internals)
+    - Group lint errors by rule
+    - Remove decorative/progress lines
+    - Cap output (max failures, max lines per failure)
+    - Deduplicate identical errors
+    - 1-line summary for passing runs
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\(B|\x1b\[\?[0-9;]*[a-zA-Z]")
+DECORATIVE_RE = re.compile(r"^[\s=\-_~*]{3,}\s*$")
+PROGRESS_RE = re.compile(r"^\s*[\|/\\\-]\s|^\s*\d+%\s*[\|█▓▒░]|^\.{4,}$")
+TIMESTAMP_ONLY_RE = re.compile(r"^\[?\d{4}[-/]\d{2}[-/]\d{2}[\sT]\d{2}:\d{2}:\d{2}[^\]]*\]?\s*$")
+
+DEFAULT_MAX_FAILURES = 10
+DEFAULT_MAX_LINES = 15
+OUTPUT_DIR = Path.home() / ".local" / "share" / "wrun"
+
+# Framework internal paths to skip in stack traces
+SKIP_FRAMES = {
+    "site-packages",
+    "_pytest",
+    "pluggy",
+    "node_modules",
+    "_pydevd",
+    "importlib",
+    "unittest/",
+    "asyncio/",
+    "concurrent/futures",
+    "threading.py",
+}
+
+
+# ─── Data Models ──────────────────────────────────────────────────────────────
+
+
+@dataclass
+class Config:
+    max_failures: int = DEFAULT_MAX_FAILURES
+    max_lines: int = DEFAULT_MAX_LINES
+    full: bool = False
+    json_output: bool = False
+    quiet: bool = False
+    no_save: bool = False
+    stdin_mode: bool = False
+    tool_hint: str = ""
+
+
+@dataclass
+class Failure:
+    name: str
+    file: str
+    line: Optional[int] = None
+    message: str = ""
+
+
+@dataclass
+class LintIssue:
+    file: str
+    line: int
+    col: int = 0
+    code: str = ""
+    message: str = ""
+
+
+@dataclass
+class Result:
+    tool: str
+    exit_code: int
+    duration: float
+    total: int = 0
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: int = 0
+    failures: list[Failure] = field(default_factory=list)
+    lint_issues: list[LintIssue] = field(default_factory=list)
+    raw_output_path: str = ""
+    raw_line_count: int = 0
+    raw_byte_count: int = 0
+    extra: dict = field(default_factory=dict)
+
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
+def get_git_root() -> Optional[Path]:
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if r.returncode == 0:
+            return Path(r.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def relativize_path(path_str: str, root: Path) -> str:
+    """Convert an absolute path to relative, handling worktree roots.
+    
+    Keeps absolute paths for files outside the project root to avoid
+    confusing ../../ traversals.
+    """
+    if not path_str:
+        return path_str
+    try:
+        p = Path(path_str)
+        if p.is_absolute():
+            rel = p.relative_to(root)
+            # Avoid ../../ paths - keep absolute if outside project
+            rel_str = str(rel)
+            if rel_str.startswith(".."):
+                return path_str
+            return rel_str
+    except (ValueError, OSError):
+        pass
+    # For already-relative paths, check for excessive traversal
+    if path_str.startswith("../../"):
+        return str(Path(path_str).resolve())
+    return path_str
+
+
+def relativize_text(text: str, root: Optional[Path]) -> str:
+    """Replace all occurrences of the git root path with relative paths."""
+    if not root:
+        root = Path.cwd()
+    root_str = str(root)
+    text = text.replace(root_str + os.sep, "")
+    text = text.replace(root_str, ".")
+
+    # Resolve ../../ traversals back to absolute for clarity
+    def _resolve_traversal(m: re.Match) -> str:
+        rel = m.group(0)
+        try:
+            resolved = str((root / rel).resolve())
+            # Only replace if the resolved path exists and is shorter
+            if len(resolved) < len(rel) or rel.count("../") >= 2:
+                return resolved
+        except (OSError, ValueError):
+            pass
+        return rel
+
+    text = re.sub(r"(?:\.\./){2,}[^\s:]+", _resolve_traversal, text)
+    return text
+
+
+def is_framework_frame(line: str) -> bool:
+    """Check if a stack trace line is from a framework internal."""
+    return any(skip in line for skip in SKIP_FRAMES)
+
+
+def truncate_stack_trace(lines: list[str], max_lines: int) -> list[str]:
+    """Keep only user-relevant frames from a stack trace."""
+    result = []
+    skipped = 0
+    for line in lines:
+        if is_framework_frame(line):
+            skipped += 1
+            continue
+        result.append(line)
+        if len(result) >= max_lines:
+            break
+
+    if skipped > 0:
+        result.append(f"  ... ({skipped} framework frames hidden)")
+    return result
+
+
+def remove_empty_and_decorative(lines: list[str]) -> list[str]:
+    """Remove blank lines and decorative separators."""
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if DECORATIVE_RE.match(stripped):
+            continue
+        if PROGRESS_RE.match(stripped):
+            continue
+        if TIMESTAMP_ONLY_RE.match(stripped):
+            continue
+        result.append(line)
+    return result
+
+
+# ─── Tool Detection ──────────────────────────────────────────────────────────
+
+TOOL_MAP = [
+    ("pytest", ["pytest", "py.test", "python -m pytest"]),
+    ("vitest", ["vitest"]),
+    ("jest", ["jest"]),
+    ("bun_test", ["bun test"]),
+    ("ruff_check", ["ruff check"]),
+    ("ruff_format", ["ruff format"]),
+    ("biome", ["biome check", "biome lint", "biome ci"]),
+    ("tsc", ["tsc", "npx tsc", "bunx tsc"]),
+    ("mypy", ["mypy"]),
+    ("ty", ["ty check"]),
+]
+
+
+def detect_tool(cmd_parts: list[str]) -> str:
+    cmd_str = " ".join(cmd_parts).lower()
+    # Strip common prefixes for matching
+    for prefix in ["uv run ", "bun run ", "bunx ", "npx ", "pnpm exec ", "yarn ", "python -m "]:
+        cmd_str_check = cmd_str.replace(prefix, "")
+        for tool, patterns in TOOL_MAP:
+            for pattern in patterns:
+                if pattern in cmd_str_check or pattern in cmd_str:
+                    return tool
+    # Direct check without prefix stripping
+    for tool, patterns in TOOL_MAP:
+        for pattern in patterns:
+            if pattern in cmd_str:
+                return tool
+    return "generic"
+
+
+def detect_tool_from_output(output: str) -> str:
+    """Fallback: detect tool from output patterns when command detection fails."""
+    # Check first and last 30 lines for known patterns
+    lines = output.splitlines()
+    sample = "\n".join(lines[:30] + lines[-30:])
+
+    if "pytest" in sample or "test session starts" in sample or "short test summary info" in sample:
+        return "pytest"
+    if "FAIL " in sample and ("Tests " in sample or "Test Suites" in sample):
+        return "vitest"  # covers vitest/jest/bun
+    if re.search(r"\S+:\d+:\d+:\s+[A-Z]\d+\s+", sample):
+        return "ruff_check"
+    if "error TS" in sample:
+        return "tsc"
+    if re.search(r"Found \d+ error", sample):
+        # Could be ruff, tsc, or biome - check more
+        if "TS" in sample:
+            return "tsc"
+        return "ruff_check"
+    return "generic"
+
+
+# ─── Parsers ──────────────────────────────────────────────────────────────────
+
+
+class Parser(ABC):
+    @abstractmethod
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        ...
+
+
+class PytestParser(Parser):
+    """Parser for pytest output."""
+
+    SUMMARY_RE = re.compile(
+        r"(?:=+\s+)?"
+        r"(?:(?P<failed>\d+)\s+failed)?"
+        r"[,\s]*"
+        r"(?:(?P<passed>\d+)\s+passed)?"
+        r"[,\s]*"
+        r"(?:(?P<skipped>\d+)\s+(?:skipped|deselected))?"
+        r"[,\s]*"
+        r"(?:(?P<error>\d+)\s+error)?"
+        r"[,\s]*"
+        r"(?:(?P<warning>\d+)\s+warning)?"
+        r"(?:\s+in\s+(?P<duration>[\d.]+)s)?"
+    )
+
+    SHORT_SUMMARY_RE = re.compile(
+        r"^(?:FAILED|ERROR)\s+(?P<file>[^\s:]+)::(?P<test>[^\s]+)"
+        r"(?:\s*-\s*(?P<message>.+))?$"
+    )
+
+    LOCATION_RE = re.compile(r"(\S+\.py):(\d+):")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        lines = output.splitlines()
+        result = Result(tool="pytest", exit_code=0, duration=0)
+
+        # Parse summary line (last meaningful line)
+        for line in reversed(lines):
+            m = self.SUMMARY_RE.search(line)
+            if m and any(m.group(g) for g in ["failed", "passed", "skipped", "error"]):
+                result.failed = int(m.group("failed") or 0)
+                result.passed = int(m.group("passed") or 0)
+                result.skipped = int(m.group("skipped") or 0)
+                result.errors = int(m.group("error") or 0)
+                result.total = result.passed + result.failed + result.skipped + result.errors
+                if m.group("duration"):
+                    result.duration = float(m.group("duration"))
+                break
+
+        # Step 1: Extract line numbers + assertion details from FAILURES section
+        line_map: dict[str, int] = {}  # test_name -> line_number
+        assert_map: dict[str, str] = {}  # test_name -> assertion detail
+        in_failures = False
+        current_test = ""
+        for line in lines:
+            if "FAILURES" in line and line.strip().startswith("="):
+                in_failures = True
+                continue
+            if not in_failures:
+                continue
+            if line.strip().startswith("=") and ("passed" in line or "error" in line):
+                break
+            if line.strip().startswith("_") and line.strip().endswith("_"):
+                current_test = line.strip().strip("_ ")
+                continue
+            if current_test:
+                loc = self.LOCATION_RE.search(line)
+                if loc and current_test not in line_map:
+                    line_map[current_test] = int(loc.group(2))
+                # Extract E-lines (assertion details)
+                stripped = line.strip()
+                if stripped.startswith("E "):
+                    detail = stripped[2:].strip()
+                    # Always prefer assert/where lines (actual vs expected)
+                    if detail.startswith("assert ") or detail.startswith("where "):
+                        assert_map[current_test] = detail
+                    elif current_test not in assert_map:
+                        assert_map[current_test] = detail
+
+        # Step 2: Parse short test summary with multi-line continuation
+        in_short_summary = False
+        current_failure: Optional[Failure] = None
+        for line in lines:
+            if "short test summary info" in line:
+                in_short_summary = True
+                continue
+            if not in_short_summary:
+                continue
+            if line.startswith("="):
+                break
+
+            m = self.SHORT_SUMMARY_RE.match(line.strip())
+            if m:
+                # Save previous failure
+                if current_failure:
+                    result.failures.append(current_failure)
+
+                file_path = relativize_path(m.group("file"), git_root) if git_root else m.group("file")
+                test_name = m.group("test")
+                line_num = line_map.get(test_name)
+                msg = (m.group("message") or "").strip()
+                # Enrich with assertion detail from FAILURES section
+                assertion = assert_map.get(test_name, "")
+                if assertion and assertion not in msg:
+                    msg = f"{msg} | {assertion}" if msg else assertion
+                current_failure = Failure(
+                    name=test_name,
+                    file=file_path,
+                    line=line_num,
+                    message=msg,
+                )
+            elif current_failure and line.strip():
+                # Continuation line (e.g., "assert 401 == 200")
+                cont = line.strip()
+                if cont.startswith("+"):
+                    cont = cont.lstrip("+ ")
+                if current_failure.message:
+                    current_failure.message += " | " + cont
+                else:
+                    current_failure.message = cont
+
+        if current_failure:
+            result.failures.append(current_failure)
+
+        # Fallback: parse FAILURES section if no short summary
+        if not result.failures and result.failed > 0:
+            self._parse_failures_section(lines, result, git_root, config)
+
+        return result
+
+    def _parse_failures_section(
+        self, lines: list[str], result: Result, git_root: Optional[Path], config: Config
+    ) -> None:
+        in_failures = False
+        current_name = ""
+        current_lines: list[str] = []
+        current_file = ""
+
+        for line in lines:
+            if "FAILURES" in line and line.strip().startswith("="):
+                in_failures = True
+                continue
+            if not in_failures:
+                continue
+            if line.strip().startswith("=") and "passed" in line:
+                break
+
+            # New test failure header
+            if line.strip().startswith("_") and line.strip().endswith("_"):
+                if current_name:
+                    self._add_failure(result, current_name, current_file, current_lines, git_root, config)
+                current_name = line.strip().strip("_ ")
+                current_lines = []
+                current_file = ""
+                continue
+
+            if current_name:
+                # Capture file reference
+                file_match = re.search(r"(\S+\.py):(\d+)", line)
+                if file_match and not current_file:
+                    current_file = file_match.group(1)
+
+                current_lines.append(line)
+
+        if current_name:
+            self._add_failure(result, current_name, current_file, current_lines, git_root, config)
+
+    def _add_failure(
+        self,
+        result: Result,
+        name: str,
+        file: str,
+        raw_lines: list[str],
+        git_root: Optional[Path],
+        config: Config,
+    ) -> None:
+        filtered = truncate_stack_trace(raw_lines, config.max_lines)
+        filtered = remove_empty_and_decorative(filtered)
+        message = "\n".join(filtered[:config.max_lines])
+        if git_root and file:
+            file = relativize_path(file, git_root)
+        result.failures.append(Failure(name=name, file=file, message=message))
+
+
+class VitestBunParser(Parser):
+    """Parser for vitest, jest, and bun test output."""
+
+    SUMMARY_RE = re.compile(
+        r"Tests?\s+"
+        r"(?:(?P<failed>\d+)\s+failed\s*\|?\s*)?"
+        r"(?:(?P<passed>\d+)\s+passed\s*\|?\s*)?"
+        r"(?:(?P<skipped>\d+)\s+(?:skipped|todo)\s*\|?\s*)?"
+        r"\(?(?P<total>\d+)\)?"
+    )
+
+    DURATION_RE = re.compile(r"(?:Duration|Time)\s+([\d.]+)\s*([ms]+)")
+
+    FAIL_HEADER_RE = re.compile(
+        r"(?:FAIL|×|✕|✗)\s+(?P<file>\S+)"
+        r"(?:\s*>\s*(?P<suite>.+?))?"
+        r"(?:\s*>\s*(?P<test>.+))?"
+    )
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        lines = output.splitlines()
+        result = Result(tool="vitest", exit_code=0, duration=0)
+
+        # Parse summary
+        for line in reversed(lines):
+            m = self.SUMMARY_RE.search(line)
+            if m and m.group("total"):
+                result.total = int(m.group("total"))
+                result.passed = int(m.group("passed") or 0)
+                result.failed = int(m.group("failed") or 0)
+                result.skipped = int(m.group("skipped") or 0)
+                break
+
+        # Parse duration
+        for line in reversed(lines):
+            m = self.DURATION_RE.search(line)
+            if m:
+                val = float(m.group(1))
+                unit = m.group(2)
+                result.duration = val / 1000 if unit == "ms" else val
+                break
+
+        # Parse failures
+        self._parse_fail_blocks(lines, result, git_root, config)
+
+        return result
+
+    def _parse_fail_blocks(
+        self, lines: list[str], result: Result, git_root: Optional[Path], config: Config
+    ) -> None:
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            m = self.FAIL_HEADER_RE.match(line)
+            if m:
+                file_path = m.group("file")
+                test_name = m.group("test") or m.group("suite") or "unknown"
+                if git_root:
+                    file_path = relativize_path(file_path, git_root)
+
+                # Collect error message lines
+                msg_lines = []
+                i += 1
+                while i < len(lines):
+                    next_line = lines[i]
+                    next_stripped = next_line.strip()
+                    if not next_stripped:
+                        i += 1
+                        continue
+                    if self.FAIL_HEADER_RE.match(next_stripped):
+                        break
+                    if next_stripped.startswith(("Tests ", "Test Suites", "Duration", "Time")):
+                        break
+                    if re.match(r"^[─⎯\-]{3,}", next_stripped):
+                        i += 1
+                        continue
+                    msg_lines.append(next_line)
+                    i += 1
+
+                filtered = truncate_stack_trace(msg_lines, config.max_lines)
+                filtered = remove_empty_and_decorative(filtered)
+                message = "\n".join(filtered[:config.max_lines]).strip()
+
+                # Extract line number from message
+                line_num = None
+                loc_match = re.search(r"(\S+):(\d+):\d+", message)
+                if loc_match:
+                    line_num = int(loc_match.group(2))
+
+                result.failures.append(
+                    Failure(name=test_name, file=file_path, line=line_num, message=message)
+                )
+                continue
+            i += 1
+
+
+class RuffParser(Parser):
+    """Parser for ruff check output (supports both classic and modern format)."""
+
+    # Classic: file:line:col: CODE message
+    CLASSIC_RE = re.compile(r"^(?P<file>\S+):(?P<line>\d+):(?P<col>\d+):\s+(?P<code>\S+)\s+(?P<msg>.+)$")
+    # Modern (ruff 0.4+): CODE [*] message
+    MODERN_RULE_RE = re.compile(r"^(?P<code>[A-Z]+\d+)\s+(?:\[\*\]\s+)?(?P<msg>.+)$")
+    # Modern location: --> file:line:col
+    MODERN_LOC_RE = re.compile(r"^\s*-->\s*(?P<file>\S+):(?P<line>\d+):(?P<col>\d+)")
+    SUMMARY_RE = re.compile(r"Found\s+(?P<count>\d+)\s+error")
+    FIXABLE_RE = re.compile(r"\[?\*?\]?\s*(?P<fixable>\d+)\s+fixable")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        lines = output.splitlines()
+        result = Result(tool="ruff", exit_code=0, duration=0)
+        issues: list[LintIssue] = []
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # Try classic format first
+            m = self.CLASSIC_RE.match(line)
+            if m:
+                file_path = m.group("file")
+                if git_root:
+                    file_path = relativize_path(file_path, git_root)
+                issues.append(
+                    LintIssue(
+                        file=file_path,
+                        line=int(m.group("line")),
+                        col=int(m.group("col")),
+                        code=m.group("code"),
+                        message=m.group("msg").strip(),
+                    )
+                )
+                i += 1
+                continue
+
+            # Try modern format: CODE [*] message, then --> file:line:col
+            rm = self.MODERN_RULE_RE.match(line)
+            if rm:
+                code = rm.group("code")
+                msg = rm.group("msg").strip()
+                # Look ahead for --> location
+                file_path = ""
+                line_num = 0
+                col_num = 0
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    lm = self.MODERN_LOC_RE.match(lines[j])
+                    if lm:
+                        file_path = lm.group("file")
+                        if git_root:
+                            file_path = relativize_path(file_path, git_root)
+                        line_num = int(lm.group("line"))
+                        col_num = int(lm.group("col"))
+                        break
+                if file_path:
+                    issues.append(
+                        LintIssue(file=file_path, line=line_num, col=col_num, code=code, message=msg)
+                    )
+
+            sm = self.SUMMARY_RE.search(line)
+            if sm:
+                result.errors = int(sm.group("count"))
+
+            fm = self.FIXABLE_RE.search(line)
+            if fm:
+                result.extra["fixable"] = int(fm.group("fixable"))
+
+            i += 1
+
+        result.lint_issues = issues
+        result.total = len(issues)
+        result.failed = result.errors or len(issues)
+        return result
+
+
+class BiomeParser(Parser):
+    """Parser for biome check/lint output."""
+
+    DIAG_RE = re.compile(
+        r"(?P<file>\S+):(?P<line>\d+):(?P<col>\d+)\s+"
+        r"(?P<level>error|warning|info)\s+"
+        r"(?P<code>\S+)\s+"
+        r"(?P<msg>.+)"
+    )
+    SIMPLE_RE = re.compile(r"^(?P<file>\S+)\s+(?P<code>[a-zA-Z]+/\S+)\s+.*$")
+    SUMMARY_RE = re.compile(r"(?:Found\s+)?(?P<errors>\d+)\s+error|(?P<warns>\d+)\s+warning")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        lines = output.splitlines()
+        result = Result(tool="biome", exit_code=0, duration=0)
+        issues: list[LintIssue] = []
+
+        for line in lines:
+            line_stripped = line.strip()
+            m = self.DIAG_RE.match(line_stripped)
+            if not m:
+                m = self.SIMPLE_RE.match(line_stripped)
+            if m:
+                file_path = m.group("file")
+                if git_root:
+                    file_path = relativize_path(file_path, git_root)
+                issues.append(
+                    LintIssue(
+                        file=file_path,
+                        line=int(m.group("line")) if "line" in m.groupdict() and m.group("line") else 0,
+                        col=int(m.group("col")) if "col" in m.groupdict() and m.group("col") else 0,
+                        code=m.group("code"),
+                        message=m.group("msg").strip() if "msg" in m.groupdict() and m.group("msg") else "",
+                    )
+                )
+
+            sm = self.SUMMARY_RE.search(line)
+            if sm:
+                if sm.group("errors"):
+                    result.errors = int(sm.group("errors"))
+
+        result.lint_issues = issues
+        result.total = len(issues)
+        result.failed = result.errors or len(issues)
+        return result
+
+
+class TscParser(Parser):
+    """Parser for TypeScript compiler output."""
+
+    ERROR_RE = re.compile(
+        r"^(?P<file>\S+)\((?P<line>\d+),(?P<col>\d+)\):\s+error\s+(?P<code>TS\d+):\s+(?P<msg>.+)$"
+    )
+    ALT_ERROR_RE = re.compile(
+        r"^(?P<file>\S+):(?P<line>\d+):(?P<col>\d+)\s+-\s+error\s+(?P<code>TS\d+):\s+(?P<msg>.+)$"
+    )
+    SUMMARY_RE = re.compile(r"Found\s+(?P<count>\d+)\s+error")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        lines = output.splitlines()
+        result = Result(tool="tsc", exit_code=0, duration=0)
+        issues: list[LintIssue] = []
+
+        for line in lines:
+            line_stripped = line.strip()
+            m = self.ERROR_RE.match(line_stripped) or self.ALT_ERROR_RE.match(line_stripped)
+            if m:
+                file_path = m.group("file")
+                if git_root:
+                    file_path = relativize_path(file_path, git_root)
+                issues.append(
+                    LintIssue(
+                        file=file_path,
+                        line=int(m.group("line")),
+                        col=int(m.group("col")),
+                        code=m.group("code"),
+                        message=m.group("msg").strip(),
+                    )
+                )
+
+            sm = self.SUMMARY_RE.search(line)
+            if sm:
+                result.errors = int(sm.group("count"))
+
+        result.lint_issues = issues
+        result.total = len(issues)
+        result.failed = result.errors or len(issues)
+        return result
+
+
+class GenericParser(Parser):
+    """Fallback parser: smart head+tail truncation."""
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="generic", exit_code=0, duration=0)
+        return result
+
+
+# ─── Parser Registry ──────────────────────────────────────────────────────────
+
+PARSERS: dict[str, Parser] = {
+    "pytest": PytestParser(),
+    "vitest": VitestBunParser(),
+    "jest": VitestBunParser(),
+    "bun_test": VitestBunParser(),
+    "ruff_check": RuffParser(),
+    "ruff_format": RuffParser(),
+    "biome": BiomeParser(),
+    "tsc": TscParser(),
+    "mypy": TscParser(),  # Similar format
+    "ty": TscParser(),
+    "generic": GenericParser(),
+}
+
+
+# ─── Formatter ────────────────────────────────────────────────────────────────
+
+
+def format_result(result: Result, config: Config, raw_output: str) -> str:
+    """Format the parsed result into maximum token-efficient output for LLM."""
+    parts: list[str] = []
+
+    # ── Summary line: exit:N | tool | counts | duration ──
+    summary_parts = []
+    if result.total > 0:
+        if result.passed:
+            summary_parts.append(f"{result.passed} passed")
+        if result.failed:
+            summary_parts.append(f"{result.failed} failed")
+        if result.skipped:
+            summary_parts.append(f"{result.skipped} skipped")
+        if result.errors and result.tool not in ("ruff", "biome", "tsc", "mypy", "ty"):
+            summary_parts.append(f"{result.errors} errors")
+
+    summary_str = ", ".join(summary_parts) if summary_parts else ""
+    duration_str = f"{result.duration:.1f}s" if result.duration > 0 else ""
+
+    meta = " | ".join(filter(None, [f"exit:{result.exit_code}", result.tool, summary_str, duration_str]))
+    parts.append(meta)
+
+    # ── If passing or quiet, stop here (1 line) ──
+    if result.exit_code == 0 and (config.quiet or (not result.failures and not result.lint_issues)):
+        return "\n".join(parts)
+
+    # ── Test failures: compact 1-line per failure ──
+    if result.failures:
+        shown = result.failures[: config.max_failures]
+        for f in shown:
+            loc = f.file
+            if f.line:
+                loc += f":{f.line}"
+            # Compact: FAIL file:line :: name — message
+            line = f"FAIL {loc} :: {f.name}"
+            if f.message:
+                # Join multi-line message with | separator, cap length
+                msg = f.message.replace("\n", " | ")
+                if len(msg) > 200:
+                    msg = msg[:197] + "..."
+                line += f" — {msg}"
+            parts.append(line)
+
+        remaining = len(result.failures) - len(shown)
+        if remaining > 0:
+            parts.append(f"+{remaining} more failures")
+
+    # ── Lint issues: compact grouped ──
+    if result.lint_issues:
+        grouped: dict[str, list[LintIssue]] = {}
+        for issue in result.lint_issues:
+            key = issue.code or "unknown"
+            grouped.setdefault(key, []).append(issue)
+
+        total_shown = 0
+        for code, issues in sorted(grouped.items(), key=lambda x: -len(x[1])):
+            if total_shown >= config.max_failures:
+                break
+            msg = issues[0].message
+            # Compact locations on one line
+            locs = [f"{iss.file}:{iss.line}" for iss in issues[:4]]
+            loc_str = ", ".join(locs)
+            remaining_in_group = len(issues) - len(locs)
+            if remaining_in_group > 0:
+                loc_str += f" +{remaining_in_group}"
+            parts.append(f"{code} x{len(issues)}: {msg} [{loc_str}]")
+            total_shown += 1
+
+        remaining_groups = len(grouped) - total_shown
+        if remaining_groups > 0:
+            parts.append(f"+{remaining_groups} more rules")
+
+    # ── Generic fallback: smart head+tail ──
+    if result.tool == "generic" and result.exit_code != 0:
+        raw_lines = raw_output.splitlines()
+        clean_lines = remove_empty_and_decorative([strip_ansi(l) for l in raw_lines])
+
+        if len(clean_lines) <= 20:
+            for line in clean_lines:
+                parts.append(line)
+        else:
+            head_n = 5
+            tail_n = 15
+            for line in clean_lines[:head_n]:
+                parts.append(line)
+            parts.append(f"... ({len(clean_lines) - head_n - tail_n} lines hidden)")
+            for line in clean_lines[-tail_n:]:
+                parts.append(line)
+
+    # ── Footer: fixable hint + full output path ──
+    if "fixable" in result.extra:
+        parts.append(f"{result.extra['fixable']} fixable with --fix")
+    if result.raw_output_path:
+        parts.append(f"full: {result.raw_output_path}")
+
+    return "\n".join(parts)
+
+
+def format_json(result: Result) -> str:
+    """Format result as JSON."""
+    data = {
+        "tool": result.tool,
+        "exit_code": result.exit_code,
+        "duration": result.duration,
+        "summary": {
+            "total": result.total,
+            "passed": result.passed,
+            "failed": result.failed,
+            "skipped": result.skipped,
+            "errors": result.errors,
+        },
+        "failures": [asdict(f) for f in result.failures],
+        "lint_issues_grouped": {},
+        "raw_output_path": result.raw_output_path,
+        "raw_line_count": result.raw_line_count,
+        "raw_byte_count": result.raw_byte_count,
+    }
+
+    if result.lint_issues:
+        grouped: dict[str, list[dict]] = {}
+        for iss in result.lint_issues:
+            key = iss.code or "unknown"
+            grouped.setdefault(key, []).append(asdict(iss))
+        data["lint_issues_grouped"] = grouped
+
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+def _human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+# ─── Executor ─────────────────────────────────────────────────────────────────
+
+
+def save_raw_output(output: str, tool: str) -> str:
+    """Save full output to disk, return path."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = OUTPUT_DIR / f"{ts}-{tool}.log"
+    path.write_text(output, encoding="utf-8")
+
+    # Cleanup old files (keep last 20)
+    logs = sorted(OUTPUT_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in logs[20:]:
+        old.unlink(missing_ok=True)
+
+    return str(path)
+
+
+def run(cmd_parts: list[str], config: Config) -> int:
+    """Execute command and produce optimized output."""
+    git_root = get_git_root()
+    tool = detect_tool(cmd_parts)
+
+    # Execute command
+    start = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd_parts,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        raw_output = proc.stdout or ""
+        exit_code = proc.returncode
+    except FileNotFoundError:
+        sys.stderr.write(f"wrun: command not found: {cmd_parts[0]}\n")
+        return 127
+    except KeyboardInterrupt:
+        sys.stderr.write("\nwrun: interrupted\n")
+        return 130
+
+    elapsed = time.monotonic() - start
+
+    # Full mode: just print everything
+    if config.full:
+        clean = strip_ansi(raw_output)
+        clean = relativize_text(clean, git_root)
+        sys.stdout.write(clean)
+        return exit_code
+
+    # Clean output for parsing
+    clean_output = strip_ansi(raw_output)
+    clean_output = relativize_text(clean_output, git_root)
+
+    # Save raw output
+    raw_path = ""
+    if not config.no_save:
+        raw_path = save_raw_output(clean_output, tool)
+
+    # Fallback: detect from output if command detection gave generic
+    if tool == "generic":
+        tool = detect_tool_from_output(clean_output)
+
+    # Parse
+    parser = PARSERS.get(tool, PARSERS["generic"])
+    result = parser.parse(clean_output, git_root, config)
+    result.exit_code = exit_code
+    # Prefer tool-reported duration over wall-clock (avoids bw/Python overhead)
+    if result.duration <= 0:
+        result.duration = round(elapsed, 1)
+    result.raw_output_path = raw_path
+    result.raw_line_count = clean_output.count("\n") + (1 if clean_output and not clean_output.endswith("\n") else 0)
+    result.raw_byte_count = len(clean_output.encode("utf-8"))
+
+    # Format output
+    if config.json_output:
+        sys.stdout.write(format_json(result) + "\n")
+    else:
+        sys.stdout.write(format_result(result, config, clean_output) + "\n")
+
+    return exit_code
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def parse_args(argv: list[str]) -> tuple[Config, list[str]]:
+    """Parse bw arguments, separating them from the wrapped command."""
+    config = Config()
+    found_command = False
+    cmd_start = 0
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        elif arg == "--full":
+            config.full = True
+        elif arg == "--json":
+            config.json_output = True
+        elif arg in ("-q", "--quiet"):
+            config.quiet = True
+        elif arg == "--no-save":
+            config.no_save = True
+        elif arg == "--stdin":
+            config.stdin_mode = True
+        elif arg == "--tool":
+            i += 1
+            if i < len(argv):
+                config.tool_hint = argv[i]
+        elif arg.startswith("--tool="):
+            config.tool_hint = arg.split("=", 1)[1]
+        elif arg == "--max-failures":
+            i += 1
+            if i < len(argv):
+                config.max_failures = int(argv[i])
+        elif arg == "--max-lines":
+            i += 1
+            if i < len(argv):
+                config.max_lines = int(argv[i])
+        elif arg.startswith("--max-failures="):
+            config.max_failures = int(arg.split("=", 1)[1])
+        elif arg.startswith("--max-lines="):
+            config.max_lines = int(arg.split("=", 1)[1])
+        else:
+            cmd_start = i
+            found_command = True
+            break
+        i += 1
+
+    command = argv[cmd_start:] if found_command else []
+    return config, command
+
+
+def run_stdin(config: Config) -> int:
+    """Process stdin and produce optimized output."""
+    git_root = get_git_root()
+    raw_output = sys.stdin.read()
+
+    # Clean output
+    clean_output = strip_ansi(raw_output)
+    clean_output = relativize_text(clean_output, git_root)
+
+    # Detect tool
+    if config.tool_hint and config.tool_hint in PARSERS:
+        tool = config.tool_hint
+    else:
+        tool = detect_tool_from_output(clean_output)
+
+    # Full mode
+    if config.full:
+        sys.stdout.write(clean_output)
+        return 0
+
+    # Save raw output
+    raw_path = ""
+    if not config.no_save:
+        raw_path = save_raw_output(clean_output, tool)
+
+    # Parse
+    parser = PARSERS.get(tool, PARSERS["generic"])
+    result = parser.parse(clean_output, git_root, config)
+    result.exit_code = 1 if result.failed > 0 else 0
+    result.raw_output_path = raw_path
+    result.raw_line_count = clean_output.count("\n") + (1 if clean_output and not clean_output.endswith("\n") else 0)
+    result.raw_byte_count = len(clean_output.encode("utf-8"))
+
+    # Format output
+    if config.json_output:
+        sys.stdout.write(format_json(result) + "\n")
+    else:
+        sys.stdout.write(format_result(result, config, clean_output) + "\n")
+
+    return result.exit_code
+
+
+def main() -> None:
+    if len(sys.argv) < 2 and sys.stdin.isatty():
+        print(__doc__)
+        sys.exit(1)
+
+    config, command = parse_args(sys.argv[1:])
+
+    # Stdin mode: read from pipe or --stdin flag
+    if config.stdin_mode or (not command and not sys.stdin.isatty()):
+        config.stdin_mode = True
+        exit_code = run_stdin(config)
+        sys.exit(exit_code)
+
+    if not command:
+        sys.stderr.write("wrun: no command specified\n")
+        sys.exit(1)
+
+    exit_code = run(command, config)
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
