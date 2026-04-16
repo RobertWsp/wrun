@@ -63,7 +63,13 @@ from typing import Optional
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\(B|\x1b\[\?[0-9;]*[a-zA-Z]")
+ANSI_RE = re.compile(
+    r"\x1b\[[0-9;]*[a-zA-Z]"       # CSI sequences (colors, cursor)
+    r"|\x1b\].*?(?:\x07|\x1b\\)"   # OSC sequences (hyperlinks, titles) - BEL or ST terminator
+    r"|\x1b\(B"                     # Character set selection
+    r"|\x1b\[\?[0-9;]*[a-zA-Z]"    # Private mode sequences
+    r"|]8;;[^\x07\x1b]*(?:\x07|\x1b\\|\\\\|\s)"  # Residual OSC 8 hyperlinks after partial strip
+)
 DECORATIVE_RE = re.compile(r"^[\s=\-_~*]{3,}\s*$")
 PROGRESS_RE = re.compile(r"^\s*[\|/\\\-]\s|^\s*\d+%\s*[\|█▓▒░]|^\.{4,}$")
 TIMESTAMP_ONLY_RE = re.compile(r"^\[?\d{4}[-/]\d{2}[-/]\d{2}[\sT]\d{2}:\d{2}:\d{2}[^\]]*\]?\s*$")
@@ -352,37 +358,42 @@ class PytestParser(Parser):
                     result.duration = float(m.group("duration"))
                 break
 
-        # Step 1: Extract line numbers + assertion details from FAILURES section
-        line_map: dict[str, int] = {}  # test_name -> line_number
-        assert_map: dict[str, str] = {}  # test_name -> assertion detail
+        # Step 1: Extract line numbers + assertion details + full error messages from FAILURES section
+        # NOTE: FAILURES uses "." separator (TestAuth.test_login) while short summary uses "::"
+        #       We normalize all keys to "::" format for consistent lookup
+        line_map: dict[str, int] = {}  # normalized_name -> line_number
+        assert_map: dict[str, str] = {}  # normalized_name -> assertion detail
+        error_map: dict[str, str] = {}  # normalized_name -> full error message (first E line)
         in_failures = False
         current_test = ""
+        current_test_key = ""
         for line in lines:
             if "FAILURES" in line and line.strip().startswith("="):
                 in_failures = True
                 continue
             if not in_failures:
                 continue
-            if line.strip().startswith("=") and ("passed" in line or "error" in line):
+            if line.strip().startswith("=") and ("passed" in line or "error" in line or "warning" in line):
                 break
             if line.strip().startswith("_") and line.strip().endswith("_"):
                 current_test = line.strip().strip("_ ")
+                # Normalize: "TestAuth.test_login" -> "TestAuth::test_login"
+                current_test_key = current_test.replace(".", "::")
                 continue
-            if current_test:
+            if current_test_key:
                 loc = self.LOCATION_RE.search(line)
-                if loc and current_test not in line_map:
-                    line_map[current_test] = int(loc.group(2))
-                # Extract E-lines (assertion details)
+                if loc and current_test_key not in line_map:
+                    line_map[current_test_key] = int(loc.group(2))
+                # Extract E-lines (assertion details + full error)
                 stripped = line.strip()
                 if stripped.startswith("E "):
                     detail = stripped[2:].strip()
-                    # Always prefer assert/where lines (actual vs expected)
                     if detail.startswith("assert ") or detail.startswith("where "):
-                        assert_map[current_test] = detail
-                    elif current_test not in assert_map:
-                        assert_map[current_test] = detail
+                        assert_map[current_test_key] = detail
+                    elif current_test_key not in error_map:
+                        error_map[current_test_key] = detail
 
-        # Step 2: Parse short test summary with multi-line continuation
+        # Step 2: Parse short test summary, enrich with FAILURES data
         in_short_summary = False
         current_failure: Optional[Failure] = None
         for line in lines:
@@ -396,18 +407,28 @@ class PytestParser(Parser):
 
             m = self.SHORT_SUMMARY_RE.match(line.strip())
             if m:
-                # Save previous failure
                 if current_failure:
                     result.failures.append(current_failure)
 
                 file_path = relativize_path(m.group("file"), git_root) if git_root else m.group("file")
                 test_name = m.group("test")
                 line_num = line_map.get(test_name)
-                msg = (m.group("message") or "").strip()
-                # Enrich with assertion detail from FAILURES section
+
+                # Build message: prefer FAILURES section data over truncated short summary
+                short_msg = (m.group("message") or "").strip()
+                full_error = error_map.get(test_name, "")
                 assertion = assert_map.get(test_name, "")
+
+                # If short summary is truncated (ends with ...), use full error from FAILURES
+                if short_msg.endswith("...") and full_error:
+                    msg = full_error
+                else:
+                    msg = short_msg
+
+                # Append assertion detail (actual vs expected)
                 if assertion and assertion not in msg:
                     msg = f"{msg} | {assertion}" if msg else assertion
+
                 current_failure = Failure(
                     name=test_name,
                     file=file_path,
@@ -415,7 +436,6 @@ class PytestParser(Parser):
                     message=msg,
                 )
             elif current_failure and line.strip():
-                # Continuation line (e.g., "assert 401 == 200")
                 cont = line.strip()
                 if cont.startswith("+"):
                     cont = cont.lstrip("+ ")
@@ -588,8 +608,8 @@ class RuffParser(Parser):
 
     # Classic: file:line:col: CODE message
     CLASSIC_RE = re.compile(r"^(?P<file>\S+):(?P<line>\d+):(?P<col>\d+):\s+(?P<code>\S+)\s+(?P<msg>.+)$")
-    # Modern (ruff 0.4+): CODE [*] message
-    MODERN_RULE_RE = re.compile(r"^(?P<code>[A-Z]+\d+)\s+(?:\[\*\]\s+)?(?P<msg>.+)$")
+    # Modern (ruff 0.4+): CODE [*] message — ruff rules are 1-3 letters + 3-4 digits
+    MODERN_RULE_RE = re.compile(r"^(?P<code>[A-Z]{1,3}\d{3,4})\s+(?:\[\*\]\s+)?(?P<msg>.+)$")
     # Modern location: --> file:line:col
     MODERN_LOC_RE = re.compile(r"^\s*-->\s*(?P<file>\S+):(?P<line>\d+):(?P<col>\d+)")
     SUMMARY_RE = re.compile(r"Found\s+(?P<count>\d+)\s+error")
@@ -872,7 +892,9 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
     if "fixable" in result.extra:
         parts.append(f"{result.extra['fixable']} fixable with --fix")
     if result.raw_output_path:
-        parts.append(f"full: {result.raw_output_path}")
+        # Shorten path with ~ for home directory
+        display_path = result.raw_output_path.replace(str(Path.home()), "~")
+        parts.append(f"full: {display_path}")
 
     return "\n".join(parts)
 
