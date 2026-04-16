@@ -772,10 +772,47 @@ class TscParser(Parser):
 
 
 class GenericParser(Parser):
-    """Fallback parser: smart head+tail truncation."""
+    """Smart fallback: extract error-relevant lines instead of blind head+tail."""
+
+    ERROR_PATTERNS = re.compile(
+        r"(?i)^.*("
+        r"error[\s:\[]|ERROR[\s:\[]|"
+        r"FAIL(?:ED|URE)?[\s:\[]|"
+        r"fatal[\s:\[]|FATAL[\s:\[]|"
+        r"panic[\s:\[]|"
+        r"Traceback \(most recent|"
+        r"Exception[\s:]|"
+        r"cannot find|Could not|No such file|Permission denied|"
+        r"command not found|"
+        r"segmentation fault|core dumped|"
+        r"BUILD FAIL|compilation fail|"
+        r"SyntaxError|TypeError|ValueError|KeyError|"
+        r"ImportError|ModuleNotFoundError|"
+        r"warning[\s:\[]"
+        r").*$",
+        re.MULTILINE,
+    )
 
     def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
         result = Result(tool="generic", exit_code=0, duration=0)
+        # Store error-extracted lines for the formatter
+        lines = output.splitlines()
+        error_lines: list[str] = []
+        seen_indices: set[int] = set()
+
+        for m in self.ERROR_PATTERNS.finditer(output):
+            # Find line index
+            line_start = output.count("\n", 0, m.start())
+            # Get context: 1 line before + error + 2 lines after
+            for idx in range(max(0, line_start - 1), min(len(lines), line_start + 3)):
+                if idx not in seen_indices:
+                    seen_indices.add(idx)
+                    error_lines.append(lines[idx])
+            if len(error_lines) >= config.max_lines * 2:
+                break
+
+        result.extra["error_lines"] = error_lines
+        result.extra["total_lines"] = len(lines)
         return result
 
 
@@ -816,7 +853,11 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
             summary_parts.append(f"{result.errors} errors")
 
     summary_str = ", ".join(summary_parts) if summary_parts else ""
-    duration_str = f"{result.duration:.1f}s" if result.duration > 0 else ""
+    # Show 2 decimals for sub-second, 1 decimal otherwise
+    if result.duration > 0:
+        duration_str = f"{result.duration:.2f}s" if result.duration < 1 else f"{result.duration:.1f}s"
+    else:
+        duration_str = ""
 
     meta = " | ".join(filter(None, [f"exit:{result.exit_code}", result.tool, summary_str, duration_str]))
     parts.append(meta)
@@ -871,22 +912,32 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
         if remaining_groups > 0:
             parts.append(f"+{remaining_groups} more rules")
 
-    # ── Generic fallback: smart head+tail ──
+    # ── Generic fallback: error extraction or head+tail ──
     if result.tool == "generic" and result.exit_code != 0:
-        raw_lines = raw_output.splitlines()
-        clean_lines = remove_empty_and_decorative([strip_ansi(l) for l in raw_lines])
+        error_lines = result.extra.get("error_lines", [])
+        total = result.extra.get("total_lines", 0)
 
-        if len(clean_lines) <= 20:
-            for line in clean_lines:
+        if error_lines:
+            # Smart mode: show extracted error lines with context
+            clean = remove_empty_and_decorative(error_lines)[:config.max_lines * 2]
+            for line in clean:
                 parts.append(line)
+            if total > len(clean):
+                parts.append(f"... ({total - len(clean)} lines hidden, {total} total)")
         else:
-            head_n = 5
-            tail_n = 15
-            for line in clean_lines[:head_n]:
-                parts.append(line)
-            parts.append(f"... ({len(clean_lines) - head_n - tail_n} lines hidden)")
-            for line in clean_lines[-tail_n:]:
-                parts.append(line)
+            # Fallback: head+tail truncation
+            raw_lines = raw_output.splitlines()
+            clean_lines = remove_empty_and_decorative([strip_ansi(l) for l in raw_lines])
+
+            if len(clean_lines) <= 20:
+                for line in clean_lines:
+                    parts.append(line)
+            else:
+                for line in clean_lines[:5]:
+                    parts.append(line)
+                parts.append(f"... ({len(clean_lines) - 20} lines hidden)")
+                for line in clean_lines[-15:]:
+                    parts.append(line)
 
     # ── Footer: fixable hint + full output path ──
     if "fixable" in result.extra:
@@ -926,15 +977,7 @@ def format_json(result: Result) -> str:
             grouped.setdefault(key, []).append(asdict(iss))
         data["lint_issues_grouped"] = grouped
 
-    return json.dumps(data, indent=2, ensure_ascii=False)
-
-
-def _human_bytes(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if abs(n) < 1024:
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}TB"
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
 
 # ─── Executor ─────────────────────────────────────────────────────────────────
@@ -943,7 +986,7 @@ def _human_bytes(n: int) -> str:
 def save_raw_output(output: str, tool: str) -> str:
     """Save full output to disk, return path."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:20]  # Include microseconds to avoid collision
     path = OUTPUT_DIR / f"{ts}-{tool}.log"
     path.write_text(output, encoding="utf-8")
 
@@ -1024,7 +1067,7 @@ def run(cmd_parts: list[str], config: Config) -> int:
 
 
 def parse_args(argv: list[str]) -> tuple[Config, list[str]]:
-    """Parse bw arguments, separating them from the wrapped command."""
+    """Parse wrun arguments, separating them from the wrapped command."""
     config = Config()
     found_command = False
     cmd_start = 0
