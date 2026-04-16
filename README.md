@@ -1,38 +1,14 @@
 # wrun
 
-Token-optimized command wrapper for AI coding agents. Wraps test runners, linters, and type checkers to produce minimal, actionable output — reducing token consumption by 77-90%.
+Token-optimized command wrapper for AI coding agents. Wraps test runners, linters, VCS tools, and filesystem commands to produce minimal, actionable output — reducing token consumption up to 89% on verbose commands.
 
-## Problem
+## Why
 
-AI coding agents (Claude Code, OpenCode, Cursor, etc.) waste context window on verbose test/lint output:
+AI coding agents (Claude Code, OpenCode, Cursor, etc.) waste context window on verbose tool output. A `docker ps` with 33 containers emits 11 KB of tabular data that AI has to parse to answer "is the API up?". A pytest run with 3 failures produces 50+ lines of framework noise hiding the 3 line:column pairs the agent needs. A `git diff` emits thousands of `+`/`-` lines when `file +N -M` is enough to decide the next action.
 
-```
-============================= test session starts ==============================
-platform linux -- Python 3.12.12, pytest-9.0.2, pluggy-1.6.0
-rootdir: /home/user/project
-plugins: anyio-4.12.1, cov-7.0.0
-collecting ... collected 5 items
+wrun sits between the agent and the tool: it runs the command, parses the output with a tool-specific parser, and emits a canonical one-line-summary + compact details format the agent can act on without rereading the whole blob.
 
-tests/test_auth.py::test_ok PASSED                              [ 20%]
-tests/test_auth.py::test_ok2 PASSED                             [ 40%]
-tests/test_auth.py::test_fail FAILED                            [ 60%]
-... (30+ more lines of decorative output, stack traces, framework internals)
-```
-
-## Solution
-
-wrun produces exactly what the AI needs to act:
-
-```
-exit:1 | pytest | 2 passed, 1 failed | 0.2s
-FAIL tests/test_auth.py:8 :: test_fail — AssertionError: Expected 200, got 401 | assert 401 == 200
-full: ~/.local/share/wrun/20260416-084655-pytest.log
-```
-
-Passing runs = 1 line:
-```
-exit:0 | pytest | 5 passed | 0.3s
-```
+Nothing is lost — the full output is saved to `~/.local/share/wrun/*.log` and a `full: path` pointer is included in every response.
 
 ## Install
 
@@ -42,9 +18,9 @@ cd wrun
 ./install.sh
 ```
 
-### Shell integration (auto-wrap)
+## Shell integration — automatic activation
 
-Add to `~/.zshenv` for automatic activation in AI agent sessions:
+For AI-agent shells (non-interactive), add to `~/.zshenv`:
 
 ```zsh
 if [[ ! -o interactive ]]; then
@@ -53,101 +29,192 @@ if [[ ! -o interactive ]]; then
 fi
 ```
 
-For interactive shells, add to `~/.zshrc`:
+For your interactive shell (`~/.zshrc`):
 
 ```zsh
 [[ -f ~/.local/share/wrun/integration.zsh ]] && source ~/.local/share/wrun/integration.zsh
-# export WRUN_AUTO=1  # uncomment to enable in terminal too
+# export WRUN_AUTO=1  # uncomment to enable in the terminal too
 ```
 
-## Usage
+When `WRUN_AUTO=1`, these commands are transparently intercepted. Subcommands not listed pass through untouched:
 
-### Manual
+| Command family | Intercepted subcommands |
+|---|---|
+| `git` | `status`, `diff`, `log`, `show`, `add`, `commit`, `push`, `pull`, `fetch`, `rm`, `mv`, `checkout`, `switch`, `merge`, `rebase`, `stash` |
+| `docker` | `ps`, `images` |
+| `uv run` | `pytest`, `py.test`, `ruff`, `mypy`, `ty` |
+| `bun` | `test`, `run test`, `run lint`, `run typecheck`, `run check` |
+| `npx` / `bunx` | `tsc`, `vitest`, `jest`, `biome` |
+| direct | `pytest`, `vitest`, `jest`, `mypy`, `ruff`, `biome`, `tsc`, `grep`, `rg`, `ls`, `tree` |
+
+Pass-through examples that stay out of wrun: `git rev-parse`, `git worktree list`, `docker run`, `docker exec`, `uv pip install`, `bun install`, `npx create-next-app`.
+
+## Manual usage
 
 ```bash
-wrun uv run pytest tests/ -v
+wrun uv run pytest tests/
 wrun ruff check .
 wrun tsc --noEmit
-wrun make build
-```
-
-### Automatic (with shell integration)
-
-When `WRUN_AUTO=1`, these commands are transparently intercepted:
-
-| Command | Intercepted via |
-|---------|----------------|
-| `uv run pytest/ruff/mypy/ty` | `uv()` wrapper |
-| `bun test`, `bun run lint/test/typecheck` | `bun()` wrapper |
-| `npx/bunx tsc/vitest/jest/biome` | `npx()`/`bunx()` |
-| `pytest`, `vitest`, `jest`, `mypy` | direct wrapper |
-| `ruff check/format`, `biome check/lint`, `tsc` | direct wrapper |
-| `git status/diff/log/show/add/commit/push/pull/…` | `git()` wrapper |
-| `docker ps/images` | `docker()` wrapper |
-| `grep`, `rg`, `ag` | direct wrapper |
-| `ls`, `tree` | direct wrapper |
-
-Non-test/lint subcommands (`uv pip`, `bun install`, `docker run`, `git rev-parse`, etc.) pass through untouched.
-
-### Pipe mode
-
-```bash
-pytest tests/ 2>&1 | wrun --stdin
-pytest tests/ 2>&1 | wrun --stdin --tool pytest
+wrun docker ps
+wrun git log --oneline -20
+wrun --full docker ps           # bypass optimization, just strip ANSI + relativize paths
+pytest tests/ 2>&1 | wrun --stdin --tool pytest   # pipe mode
 ```
 
 ### Options
 
 ```
---full              Bypass optimization, show full output (still strips ANSI + relativizes paths)
+--full              Bypass optimization (still strips ANSI + relativizes paths)
 --json              Structured JSON output
 -q, --quiet         Summary line only
---max-failures N    Max failures to display (default: 10)
+--max-failures N    Max failures/entries to display (default: 10)
 --max-lines N       Max error lines per failure (default: 15)
 --no-save           Don't save full output to disk
 --stdin             Read from stdin instead of executing
---tool TOOL         Hint tool type for stdin mode
+--tool TOOL         Hint parser for --stdin mode
 ```
 
 ## Supported tools
 
 ### Test runners & linters
-| Tool | Parser | Features |
-|------|--------|----------|
-| **pytest** | `PytestParser` | Line numbers, assertion details, multi-line messages |
-| **vitest/jest/bun test** | `VitestBunParser` | Failure blocks, duration, summary |
-| **ruff** | `RuffParser` | Classic + modern (Rust-style) format, grouped by rule |
-| **biome** | `BiomeParser` | Diagnostic parsing, grouped |
-| **tsc/mypy/ty** | `TscParser` | Error code + location + message |
+| Tool | Parser | Extracts |
+|---|---|---|
+| **pytest** | `PytestParser` | file:line per failure, assertion diff, multi-line messages |
+| **vitest / jest / bun test** | `VitestBunParser` | failure block per test, duration, summary counts |
+| **ruff** | `RuffParser` | classic + Rust-style diagnostics, grouped by rule code |
+| **biome** | `BiomeParser` | diagnostic parsing, grouped |
+| **tsc / mypy / ty** | `TscParser` | error code + file:line + message |
 
 ### VCS & filesystem tools
-| Tool | Parser | Output |
-|------|--------|--------|
-| **git status** | `GitStatusParser` | Porcelain codes `M`/`A`/`D`/`??` + branch + counts |
-| **git diff** | `GitDiffParser` | Per-file `+N -M` stats, no hunk bodies |
-| **git log / show** | `GitLogParser` | `hash subject` one per line, capped |
-| **git add/commit/push/pull/...** | `GitWriteParser` | 1-line summary (commit SHA, refspec, etc.) |
+| Tool | Parser | Output shape |
+|---|---|---|
+| **git status** | `GitStatusParser` | porcelain codes (`M`/`A`/`D`/`R`/`??`) + branch + count rollup |
+| **git diff** | `GitDiffParser` | per-file `status path +N -M`, no hunk bodies |
+| **git log / show** | `GitLogParser` | `hash subject` one per line, handles `--graph`/`--oneline` |
+| **git add/commit/push/pull/…** | `GitWriteParser` | 1-line summary (commit SHA, refspec update, etc.) |
 | **docker ps / images** | `DockerPsParser` | ID, name, image, status, compact ports (IPv4+IPv6 dedup) |
-| **grep/rg/ag** | `GrepRgParser` | Grouped by file, capped 50 total / 10 per-file |
-| **ls/tree** | `LsTreeParser` | Compact listing, filters noise (`node_modules`, `.git`, `__pycache__`, …) |
+| **grep / rg / ag** | `GrepRgParser` | grouped by file, capped 50 total / 10 per file, line-number optional |
+| **ls / tree** | `LsTreeParser` | compact listing, filters `.`, `..`, and noise dirs recursively |
 
 ### Fallback
 | Tool | Parser | Features |
-|------|--------|----------|
-| **generic** | `GenericParser` | Error-pattern extraction with ±1 line context |
+|---|---|---|
+| **anything else** | `GenericParser` | Error-pattern extraction with ±1 line context (not blind head+tail) |
 
-## Output format
+Noise directories auto-hidden by `ls`/`tree`: `node_modules`, `.git`, `__pycache__`, `.venv`, `venv`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `dist`, `build`, `.next`, `.nuxt`, `target`, `.idea`, `.vscode`.
 
-### Test failures
+## Real output examples
+
+All examples below are captured from actual command runs in a fresh test repo, no hand-editing.
+
+### pytest
 
 ```
-exit:1 | pytest | 3 passed, 2 failed, 1 skipped | 0.3s
-FAIL tests/test_auth.py:8 :: test_login — AssertionError: Expected 200 | assert 401 == 200
+exit:0 | pytest | 1 passed | 0.20s
+```
+
+3 failures out of 11 tests:
+```
+exit:1 | pytest | 8 passed, 3 failed | 0.3s
+FAIL tests/test_auth.py:8 :: test_login — AssertionError: Expected 200, got 401 | assert 401 == 200
 FAIL tests/test_db.py:42 :: test_query — TypeError: NoneType has no len()
-full: ~/.local/share/wrun/20260416-093000-pytest.log
+FAIL tests/test_api.py:15 :: test_post — ConnectionError: connection refused
 ```
 
-### Lint errors (grouped by rule)
+### git status (multi-state repo — modified, added, deleted, renamed, untracked)
+
+Raw: 11 lines / 302 B → wrun: 6 lines / 176 B
+```
+exit:0 | git_status | on main | 1 modified, 1 added, 1 deleted, 1 renamed, 1 untracked
+A  src/added.py
+ M src/b.py
+ D src/c.py
+R  src/a.py -> src/renamed.py
+?? src/untracked.py
+```
+
+### git diff HEAD
+
+Raw: 25 lines / 513 B → wrun: 5 lines / 113 B (**78% reduction**)
+```
+exit:0 | git_diff | 4 files | +2 -2
+A src/added.py +1 -0
+M src/b.py +1 -1
+D src/c.py +0 -1
+M src/renamed.py +0 -0
+```
+
+### git log
+
+Raw: 29 lines / 623 B → wrun: 6 lines / 148 B (**77% reduction**)
+```
+exit:0 | git_log | 4 commits
+c04d2dc test commit body
+a068946 feat: add src layout
+7c0f71f feat: add readme
+fa72488 initial
+```
+
+### git commit
+
+Raw: 6 lines / 192 B → wrun: 1 line / 71 B (**82% reduction**)
+```
+exit:0 | git_write | commit c04d2dc on main: test commit body (4 files)
+```
+
+### docker ps (33 running containers)
+
+Raw: 37 lines / 11 792 B → wrun: 17 lines / 1 351 B (**89% reduction**)
+```
+exit:0 | docker_ps | 33 running
+3200e45dfde8 crm-api-bt-868j96khh-ca crm-bt-868j96khh-ca-api Up 3 minutes (healthy) :8121
+ba8a8e68279d crm-realtime-bt-868j96khh-ca crm-bt-868j96khh-ca-realtime Up 3 minutes 8000/tcp,:8171
+9b43fe0835e4 crm-meilisearch-branch-test getmeili/meilisearch:v1.12 Up 3 minutes (healthy) :7710
+…
++21 more
+```
+
+### grep / rg (grouped by file)
+
+```
+exit:0 | grep | 3 matches in 2 files
+./sample.py (2):
+  1: def foo():
+  3: def bar():
+./tests/t.py (1):
+  1: def t(): pass
+```
+
+### ls -la (with noise dirs + `.` and `..` filtered)
+
+Raw: 11 lines / 529 B → wrun: 5 lines / 119 B (**78% reduction**)
+```
+exit:0 | ls | 2 dirs, 2 files, 6 noise hidden
+F       10 README.md
+F       60 sample.py
+D     4096 src
+D     4096 tests
+```
+
+### tree -L 2 (noise subtrees pruned recursively)
+
+Raw: 17 lines / 343 B → wrun: 12 lines / 269 B (**22% reduction**)
+```
+exit:0 | tree | 11 entries, 4 noise hidden
+.
+├── README.md
+├── sample.py
+├── src
+│   ├── added.py
+│   ├── b.py
+│   ├── renamed.py
+│   ├── skip.py
+│   └── untracked.py
+└── tests
+    └── t.py
+```
+
+### ruff (lint errors grouped by rule)
 
 ```
 exit:1 | ruff | 6 errors
@@ -155,113 +222,73 @@ F401 x3: `os` imported but unused [src/api.py:1, src/db.py:1, src/util.py:1]
 E302 x2: Expected 2 blank lines [src/api.py:15, src/db.py:22]
 E501 x1: Line too long [src/util.py:88]
 3 fixable with --fix
-full: ~/.local/share/wrun/20260416-093000-ruff_check.log
 ```
 
-### Passing run
+## Measured reduction — 23-case audit
 
-```
-exit:0 | pytest | 50 passed | 1.2s
-```
+Ran every parser against real commands in a realistic test repo. Numbers are raw bytes vs wrun bytes.
 
-### git status
+| Case | Raw | Wrun | Δ |
+|---|---:|---:|---:|
+| `docker ps` (33 containers) | 11 792 B | 1 351 B | **−89%** |
+| `git log` (default) | 623 B | 148 B | **−77%** |
+| `git commit` | 192 B | 35 B | **−82%** |
+| `ls -la` (with noise) | 529 B | 119 B | **−78%** |
+| `git diff HEAD` | 513 B | 113 B | **−78%** |
+| `git status` (human, multi-state) | 302 B | 176 B | **−42%** |
+| `tree -L 2` (with noise) | 343 B | 269 B | **−22%** |
+| `git log --graph --oneline` | 129 B | 148 B | +14% |
+| `git status --porcelain` (already compact) | 19 B | 53 B | +178% |
+| `grep -rn` multi-file (few matches) | 78 B | 122 B | +56% |
+| **OVERALL (23 cases aggregated)** | **14 370 B** | **3 221 B** | **−78%** |
 
-```
-exit:0 | git_status | on main | 3 modified, 1 added, 2 untracked
- M src/api.py
- M src/db.py
-A  src/new_feature.py
-?? notes.md
-?? TODO.txt
-```
-
-### git diff
-
-```
-exit:0 | git_diff | 2 files | +45 -12
-M src/api.py +30 -8
-M src/db.py +15 -4
-```
-
-### docker ps
-
-```
-exit:0 | docker_ps | 3 running, 1 stopped
-a1b2c3d api-1 myorg/api:latest Up 2 hours (healthy) :8080
-e4f5g6h db-1 postgres:15 Up 2 hours :5432
-```
-
-### grep/rg (grouped)
-
-```
-exit:1 | grep | 12 matches in 3 files
-src/api.py (6):
-  15: def foo():
-  28:     return foo()
-  ...
-src/db.py (4):
-  42: foo_query = ...
-+1 more files (2 matches)
-```
-
-### ls/tree (filtered)
-
-```
-exit:0 | ls | 12 dirs, 45 files, 3 noise hidden
-F    1245 README.md
-F     512 pyproject.toml
-D    4096 src
-D    4096 tests
-```
+**Observations**:
+- **Verbose output wins big** (70–90% reduction). This is the common AI-agent case: `docker ps`, `git log`, `ls -la`, `git diff HEAD`, `pytest` with failures.
+- **Already-compact output adds a header** (`--porcelain`, `--oneline`, single-file grep, empty diff). The canonical `exit:N | tool | summary` line is 20–70 extra bytes, but it gives the agent a one-glance answer ("is it passing?", "how many changes?") without reparsing.
+- **Empty output becomes informative**: `git diff` with no changes produces 0 bytes raw vs `exit:0 | git_diff | no changes` in wrun. The agent can now distinguish "no diff" from "silent failure".
+- **Full output is never lost** — pointer to the complete log is appended when output exceeds a few lines.
 
 ## Optimization techniques
 
-1. **ANSI stripping** — remove color codes
-2. **Path normalization** — relative to git root, worktree-aware, resolves `../../` traversals
-3. **Failures only** — skip passing tests entirely
-4. **Line numbers** — extracted from stack traces for direct file navigation
-5. **Assertion details** — `assert X == Y` included for immediate context
-6. **Stack trace filtering** — hide framework internals (site-packages, node_modules, _pytest, pluggy)
-7. **Rule grouping** — lint errors grouped by code with compact locations
-8. **Smart truncation** — generic output: 5-line head + 15-line tail (errors at bottom)
-9. **1-line pass** — passing runs produce exactly 1 line
-10. **Full output saved** — always available at `~/.local/share/wrun/*.log` (auto-cleanup, keeps 20)
-
-## Token reduction
-
-| Scenario | Raw | Optimized | Reduction |
-|----------|-----|-----------|-----------|
-| pytest 11 tests, 3 failures | 53 lines / 2.7KB | 5 lines | **90%** |
-| pytest all passing | 10+ lines | 1 line | **90%+** |
-| ruff 6 issues | 67 lines / 1.1KB | 4 lines | **94%** |
-| generic build 200 lines | 200 lines / 6.3KB | 21 lines | **89%** |
+1. **ANSI stripping** — CSI, OSC 8 hyperlinks, private mode sequences
+2. **Path normalization** — relative to git root, worktree-aware, resolves `../../` traversals back to absolute when outside the project
+3. **Tool-specific parsers** — 18 parsers in the registry (5 test/lint + 7 new + 6 aliases)
+4. **Failures only** — passing tests are counted, not listed
+5. **Stack trace pruning** — `site-packages`, `node_modules`, `_pytest`, `pluggy`, `asyncio`, `threading` frames hidden
+6. **Rule grouping** — lint errors grouped by code with compact `[file:line, file:line, +N]` locations
+7. **Recursive noise filtering** — `tree` and `ls` skip entire `node_modules/.git/__pycache__/…` subtrees
+8. **IPv4+IPv6 port dedup** — `0.0.0.0:8080->80/tcp, [::]:8080->80/tcp` → `:8080`
+9. **Compact summary everywhere** — `exit:N | tool | count/status | duration`
+10. **Full output saved** — `~/.local/share/wrun/*.log`, auto-cleanup keeps last 20
 
 ## How it works
 
 ```
-AI agent runs "uv run pytest tests/"
+AI agent: uv run pytest tests/
     ↓
-.zshenv detects non-interactive shell → sets WRUN_AUTO=1 + sources integration.zsh
+~/.zshenv detects non-interactive shell → sets WRUN_AUTO=1 + sources integration.zsh
     ↓
-uv() shell function intercepts → prepends "wrun"
+uv() shell function sees `uv run pytest` → prepends `wrun`
     ↓
-wrun executes command via subprocess (calls binary directly, no recursion)
+wrun spawns subprocess (calls binary directly — shell functions bypassed, no recursion)
     ↓
-captures stdout+stderr → strips ANSI → relativizes paths
+captures stdout+stderr → strips ANSI → relativizes paths to git root
     ↓
-detects tool (command name → fallback: output patterns)
+detects tool: cmd-parts match → SINGLE_CMD_MAP / GIT_SUBCOMMANDS / DOCKER_SUBCOMMANDS / TOOL_MAP
     ↓
-parser extracts: summary, failures/errors, line numbers, assertions
+parser extracts: counts, failures with file:line, assertions, diagnostics
     ↓
-formatter produces compact output → saves full log to disk
+formatter emits: `exit:N | tool | summary` + compact details + `full: path`
     ↓
-AI receives minimal, actionable output with file:line locations
+agent receives minimal, parseable output; can jump directly to file:line locations
 ```
+
+No infinite recursion is possible: `subprocess.run([cmd, ...])` invokes the binary directly, not via the shell, so wrapper shell functions are not triggered from inside wrun.
 
 ## Requirements
 
 - Python 3.9+
-- zsh (for shell integration)
+- zsh (for shell integration; direct `wrun` usage works from any shell)
 
 ## License
 

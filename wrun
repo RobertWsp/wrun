@@ -1018,7 +1018,8 @@ class GitLogParser(Parser):
     """Parse `git log` output. Extracts one line per commit (hash + subject)."""
 
     COMMIT_RE = re.compile(r"^commit ([0-9a-f]{7,40})")
-    ONELINE_RE = re.compile(r"^([0-9a-f]{7,40})\s+(.+)$")
+    # Accepts optional `--graph` prefix chars (*, |, /, \, _, space) before the hash
+    ONELINE_RE = re.compile(r"^[\s*|/\\_]*([0-9a-f]{7,40})\s+(.+)$")
     SUBJECT_INDENT_RE = re.compile(r"^ {4}(\S.*)$")
 
     def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
@@ -1243,14 +1244,32 @@ class GrepRgParser(Parser):
                 by_file.setdefault(path, []).append((lineno, m_dash.group(3)))
                 continue
 
-            # Fallback: file:content (no line number, rg with --no-line-number)
+            # Fallback: file:content (rg/grep with --no-line-number)
             if ":" in raw:
                 path, _, content = raw.partition(":")
-                if path and not path.isdigit() and "/" in path or path.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".rb", ".c", ".cpp", ".h", ".md", ".txt", ".yml", ".yaml", ".json", ".toml", ".lock")):
+                looks_like_path = (
+                    path
+                    and not path.isdigit()
+                    and "/" in path
+                    or path.endswith((
+                        ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs",
+                        ".java", ".rb", ".c", ".cpp", ".h", ".md", ".txt",
+                        ".yml", ".yaml", ".json", ".toml", ".lock", ".html",
+                        ".css", ".scss", ".vue", ".svelte", ".sh", ".zsh",
+                    ))
+                )
+                if looks_like_path:
                     by_file.setdefault(path, []).append((0, content))
                     continue
 
             unmatched.append(raw)
+
+        # If nothing structured matched but we have unmatched content (rg single-file
+        # without -H), treat unmatched as anonymous-file matches.
+        if not by_file and unmatched:
+            anon_matches = [(i + 1, line) for i, line in enumerate(unmatched)]
+            by_file["(match)"] = anon_matches
+            unmatched = []
 
         total_matches = sum(len(v) for v in by_file.values())
         result.total = total_matches
@@ -1288,6 +1307,7 @@ class LsTreeParser(Parser):
         if is_tree:
             # tree output ends with line like "2 directories, 5 files" — skip it
             tree_summary_re = re.compile(r"^\d+\s+director(?:y|ies),\s+\d+\s+files?$")
+            skip_indent: Optional[int] = None
             for raw in lines:
                 stripped = raw.strip()
                 if not stripped:
@@ -1297,15 +1317,26 @@ class LsTreeParser(Parser):
                 m = self.TREE_PREFIX_RE.match(raw)
                 if not m:
                     entries.append(("", raw))
+                    skip_indent = None
                     continue
+                prefix = m.group(1)
+                indent = len(prefix)
                 name = m.group(2).strip()
                 if not name:
                     continue
-                # Hide noise subtrees entirely
-                if any(n in name for n in self.NOISE_DIRS):
+                # Skip descendants of a previously hidden noise dir
+                if skip_indent is not None and indent > skip_indent:
                     hidden += 1
                     continue
-                entries.append(("", m.group(1) + name))
+                skip_indent = None
+                noise_hit = name.split()[0] if name else ""
+                if noise_hit in self.NOISE_DIRS or any(
+                    name == n or name.startswith(n + "/") for n in self.NOISE_DIRS
+                ):
+                    hidden += 1
+                    skip_indent = indent
+                    continue
+                entries.append(("", prefix + name))
         else:
             for raw in lines:
                 stripped = raw.strip()
@@ -1317,15 +1348,14 @@ class LsTreeParser(Parser):
                     size = m_long.group(3)
                     name = m_long.group(5)
                     kind = {"d": "D", "l": "L"}.get(type_char, "F")
-                    if name.split(" -> ")[0].strip() in self.NOISE_DIRS:
+                    name_head = name.split(" -> ")[0].strip()
+                    if name_head in self.NOISE_DIRS or name_head in (".", ".."):
                         hidden += 1
                         continue
-                    # Compact: D size name (skip perms/owner/date)
                     entries.append((kind, f"{kind} {size:>8} {name}"))
                 else:
-                    # Short ls: just names
                     for tok in raw.split():
-                        if tok in self.NOISE_DIRS:
+                        if tok in self.NOISE_DIRS or tok in (".", ".."):
                             hidden += 1
                             continue
                         entries.append(("", tok))
@@ -1601,7 +1631,9 @@ def _format_grep(result: Result, config: Config) -> str:
             text = content.strip()
             if len(text) > 140:
                 text = text[:137] + "..."
-            parts.append(f"  {lineno}: {text}")
+            # lineno=0 means grep output had no line number (rg --no-line-number)
+            prefix = f"  {lineno}: " if lineno > 0 else "  "
+            parts.append(f"{prefix}{text}")
         shown_total += min(per_file_cap, len(matches))
         if len(matches) > per_file_cap:
             parts.append(f"  +{len(matches) - per_file_cap} more in file")
