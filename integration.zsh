@@ -140,6 +140,56 @@ tsc() {
     if _wrun_active; then command wrun tsc "$@"; else command tsc "$@"; fi
 }
 
+# ─── git wrapper ─────────────────────────────────────────────────────────────
+# Wraps: git status, git diff, git log, git add, git commit, git push, git pull
+
+git() {
+    if _wrun_active; then
+        case "$1" in
+            status|diff|log|show|add|commit|push|pull|fetch|rm|mv|checkout|switch|merge|rebase|stash)
+                command wrun git "$@"
+                return $?
+                ;;
+        esac
+    fi
+    command git "$@"
+}
+
+# ─── docker wrapper ──────────────────────────────────────────────────────────
+# Wraps: docker ps, docker images
+
+docker() {
+    if _wrun_active; then
+        case "$1" in
+            ps|images)
+                command wrun docker "$@"
+                return $?
+                ;;
+        esac
+    fi
+    command docker "$@"
+}
+
+# ─── grep/rg wrapper ─────────────────────────────────────────────────────────
+
+grep() {
+    if _wrun_active; then command wrun grep "$@"; else command grep "$@"; fi
+}
+
+rg() {
+    if _wrun_active; then command wrun rg "$@"; else command rg "$@"; fi
+}
+
+# ─── ls/tree wrapper ─────────────────────────────────────────────────────────
+
+ls() {
+    if _wrun_active; then command wrun ls "$@"; else command ls "$@"; fi
+}
+
+tree() {
+    if _wrun_active; then command wrun tree "$@"; else command tree "$@"; fi
+}
+
 # ─── Convenience aliases ────────────────────────────────────────────────────
 
 alias wrun-on='export WRUN_AUTO=1'

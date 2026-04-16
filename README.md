@@ -82,8 +82,12 @@ When `WRUN_AUTO=1`, these commands are transparently intercepted:
 | `npx/bunx tsc/vitest/jest/biome` | `npx()`/`bunx()` |
 | `pytest`, `vitest`, `jest`, `mypy` | direct wrapper |
 | `ruff check/format`, `biome check/lint`, `tsc` | direct wrapper |
+| `git status/diff/log/show/add/commit/push/pull/…` | `git()` wrapper |
+| `docker ps/images` | `docker()` wrapper |
+| `grep`, `rg`, `ag` | direct wrapper |
+| `ls`, `tree` | direct wrapper |
 
-Non-test/lint subcommands (`uv pip`, `bun install`, etc.) pass through untouched.
+Non-test/lint subcommands (`uv pip`, `bun install`, `docker run`, `git rev-parse`, etc.) pass through untouched.
 
 ### Pipe mode
 
@@ -107,6 +111,7 @@ pytest tests/ 2>&1 | wrun --stdin --tool pytest
 
 ## Supported tools
 
+### Test runners & linters
 | Tool | Parser | Features |
 |------|--------|----------|
 | **pytest** | `PytestParser` | Line numbers, assertion details, multi-line messages |
@@ -114,7 +119,22 @@ pytest tests/ 2>&1 | wrun --stdin --tool pytest
 | **ruff** | `RuffParser` | Classic + modern (Rust-style) format, grouped by rule |
 | **biome** | `BiomeParser` | Diagnostic parsing, grouped |
 | **tsc/mypy/ty** | `TscParser` | Error code + location + message |
-| **generic** | `GenericParser` | Smart head(5)+tail(15) truncation |
+
+### VCS & filesystem tools
+| Tool | Parser | Output |
+|------|--------|--------|
+| **git status** | `GitStatusParser` | Porcelain codes `M`/`A`/`D`/`??` + branch + counts |
+| **git diff** | `GitDiffParser` | Per-file `+N -M` stats, no hunk bodies |
+| **git log / show** | `GitLogParser` | `hash subject` one per line, capped |
+| **git add/commit/push/pull/...** | `GitWriteParser` | 1-line summary (commit SHA, refspec, etc.) |
+| **docker ps / images** | `DockerPsParser` | ID, name, image, status, compact ports (IPv4+IPv6 dedup) |
+| **grep/rg/ag** | `GrepRgParser` | Grouped by file, capped 50 total / 10 per-file |
+| **ls/tree** | `LsTreeParser` | Compact listing, filters noise (`node_modules`, `.git`, `__pycache__`, …) |
+
+### Fallback
+| Tool | Parser | Features |
+|------|--------|----------|
+| **generic** | `GenericParser` | Error-pattern extraction with ±1 line context |
 
 ## Output format
 
@@ -142,6 +162,56 @@ full: ~/.local/share/wrun/20260416-093000-ruff_check.log
 
 ```
 exit:0 | pytest | 50 passed | 1.2s
+```
+
+### git status
+
+```
+exit:0 | git_status | on main | 3 modified, 1 added, 2 untracked
+ M src/api.py
+ M src/db.py
+A  src/new_feature.py
+?? notes.md
+?? TODO.txt
+```
+
+### git diff
+
+```
+exit:0 | git_diff | 2 files | +45 -12
+M src/api.py +30 -8
+M src/db.py +15 -4
+```
+
+### docker ps
+
+```
+exit:0 | docker_ps | 3 running, 1 stopped
+a1b2c3d api-1 myorg/api:latest Up 2 hours (healthy) :8080
+e4f5g6h db-1 postgres:15 Up 2 hours :5432
+```
+
+### grep/rg (grouped)
+
+```
+exit:1 | grep | 12 matches in 3 files
+src/api.py (6):
+  15: def foo():
+  28:     return foo()
+  ...
+src/db.py (4):
+  42: foo_query = ...
++1 more files (2 matches)
+```
+
+### ls/tree (filtered)
+
+```
+exit:0 | ls | 12 dirs, 45 files, 3 noise hidden
+F    1245 README.md
+F     512 pyproject.toml
+D    4096 src
+D    4096 tests
 ```
 
 ## Optimization techniques

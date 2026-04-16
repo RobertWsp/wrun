@@ -268,17 +268,93 @@ TOOL_MAP = [
     ("ty", ["ty check"]),
 ]
 
+# Standalone commands (checked via cmd_parts[0] for exact match)
+SINGLE_CMD_MAP = {
+    "grep": "grep",
+    "egrep": "grep",
+    "fgrep": "grep",
+    "rg": "grep",
+    "ag": "grep",
+    "ls": "ls_tree",
+    "ll": "ls_tree",
+    "la": "ls_tree",
+    "tree": "ls_tree",
+}
+
+# Git subcommand dispatch
+GIT_SUBCOMMANDS = {
+    "status": "git_status",
+    "diff": "git_diff",
+    "log": "git_log",
+    "show": "git_log",
+    "add": "git_write",
+    "commit": "git_write",
+    "push": "git_write",
+    "pull": "git_write",
+    "fetch": "git_write",
+    "rm": "git_write",
+    "mv": "git_write",
+    "checkout": "git_write",
+    "switch": "git_write",
+    "merge": "git_write",
+    "rebase": "git_write",
+    "stash": "git_write",
+}
+
+# Docker subcommand dispatch
+DOCKER_SUBCOMMANDS = {
+    "ps": "docker_ps",
+    "images": "docker_ps",
+    "image": "docker_ps",
+    "container": "docker_ps",
+}
+
 
 def detect_tool(cmd_parts: list[str]) -> str:
+    if not cmd_parts:
+        return "generic"
+
+    cmd0 = Path(cmd_parts[0]).name.lower()
+
+    # Single-word commands (grep, rg, ls, tree, ...)
+    if cmd0 in SINGLE_CMD_MAP:
+        return SINGLE_CMD_MAP[cmd0]
+
+    # Git subcommands (skip global flags like `-c k=v`, `-C path`, `--git-dir=...`)
+    if cmd0 == "git" and len(cmd_parts) > 1:
+        idx = 1
+        while idx < len(cmd_parts):
+            arg = cmd_parts[idx]
+            if arg in ("-c", "-C"):
+                idx += 2  # skip flag + value
+                continue
+            if arg.startswith("--git-dir") or arg.startswith("--work-tree") or arg.startswith("--namespace"):
+                idx += 1
+                continue
+            break
+        if idx < len(cmd_parts):
+            sub = cmd_parts[idx].lower()
+            if sub in GIT_SUBCOMMANDS:
+                return GIT_SUBCOMMANDS[sub]
+
+    # Docker subcommands
+    if cmd0 == "docker" and len(cmd_parts) > 1:
+        sub = cmd_parts[1].lower()
+        if sub in DOCKER_SUBCOMMANDS:
+            # Disambiguate: `docker container ls`, `docker image ls`
+            if sub in ("container", "image") and len(cmd_parts) > 2 and cmd_parts[2].lower() in ("ls", "list"):
+                return "docker_ps"
+            if sub == "ps" or sub == "images":
+                return "docker_ps"
+
+    # Fallback: TOOL_MAP substring matching for test runners and linters
     cmd_str = " ".join(cmd_parts).lower()
-    # Strip common prefixes for matching
     for prefix in ["uv run ", "bun run ", "bunx ", "npx ", "pnpm exec ", "yarn ", "python -m "]:
         cmd_str_check = cmd_str.replace(prefix, "")
         for tool, patterns in TOOL_MAP:
             for pattern in patterns:
                 if pattern in cmd_str_check or pattern in cmd_str:
                     return tool
-    # Direct check without prefix stripping
     for tool, patterns in TOOL_MAP:
         for pattern in patterns:
             if pattern in cmd_str:
@@ -771,6 +847,496 @@ class TscParser(Parser):
         return result
 
 
+class GitStatusParser(Parser):
+    """Parse `git status` and `git status --porcelain`.
+
+    Outputs a compact porcelain-like summary: `XY path` per entry,
+    where X=index status, Y=worktree status. Groups counts by type.
+    """
+
+    BRANCH_RE = re.compile(r"^On branch (\S+)")
+    HEAD_RE = re.compile(r"^HEAD detached at (\S+)")
+    PORCELAIN_RE = re.compile(r"^([ MADRCU?!])([ MADRCU?!]) (.+)$")
+
+    REGULAR_STATUS_MAP = {
+        "modified:": " M",
+        "new file:": "A ",
+        "deleted:": " D",
+        "renamed:": "R ",
+        "copied:": "C ",
+        "typechange:": "T ",
+        "both modified:": "UU",
+        "both added:": "AA",
+        "both deleted:": "DD",
+    }
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="git_status", exit_code=0, duration=0)
+        lines = output.splitlines()
+        entries: list[tuple[str, str]] = []
+        branch = ""
+        is_porcelain = True
+        untracked_section = False
+
+        for raw in lines:
+            if not raw.strip():
+                continue
+            # Regular format markers
+            m_branch = self.BRANCH_RE.match(raw)
+            if m_branch:
+                branch = m_branch.group(1)
+                is_porcelain = False
+                continue
+            m_head = self.HEAD_RE.match(raw)
+            if m_head:
+                branch = f"HEAD@{m_head.group(1)}"
+                is_porcelain = False
+                continue
+
+            # Porcelain format
+            m_porcelain = self.PORCELAIN_RE.match(raw)
+            if m_porcelain and is_porcelain:
+                xy = m_porcelain.group(1) + m_porcelain.group(2)
+                path = m_porcelain.group(3)
+                entries.append((xy, path))
+                continue
+
+            # Regular (human) format
+            if is_porcelain is False:
+                stripped = raw.strip()
+                if stripped.startswith("Untracked files:"):
+                    untracked_section = True
+                    continue
+                if stripped.startswith(("Changes ", "Unmerged ", "no changes ", "nothing to commit", "Your branch")):
+                    untracked_section = False
+                    continue
+                if stripped.startswith("(") or stripped.startswith("#"):
+                    continue
+                # Untracked entries
+                if untracked_section and not stripped.endswith(":"):
+                    entries.append(("??", stripped))
+                    continue
+                # Modified/new file/deleted/renamed
+                for prefix, code in self.REGULAR_STATUS_MAP.items():
+                    if stripped.startswith(prefix):
+                        path = stripped[len(prefix):].strip()
+                        entries.append((code, path))
+                        break
+
+        # Count by type
+        counts: dict[str, int] = {}
+        for xy, _ in entries:
+            key = xy.strip() or "?"
+            counts[key] = counts.get(key, 0) + 1
+
+        result.total = len(entries)
+        result.extra["git_branch"] = branch
+        result.extra["git_status_entries"] = entries
+        result.extra["git_status_counts"] = counts
+        return result
+
+
+class GitDiffParser(Parser):
+    """Parse `git diff` output. Extracts file stats without hunk bodies."""
+
+    FILE_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)")
+    NEW_FILE_RE = re.compile(r"^new file mode")
+    DEL_FILE_RE = re.compile(r"^deleted file mode")
+    STAT_RE = re.compile(r"^\s*(\S+)\s*\|\s*(\d+|Bin)\s*([+\-]*)\s*$")
+    STAT_SUMMARY_RE = re.compile(
+        r"(\d+)\s+files?\s+changed"
+        r"(?:,\s+(\d+)\s+insertions?\(\+\))?"
+        r"(?:,\s+(\d+)\s+deletions?\(-\))?"
+    )
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="git_diff", exit_code=0, duration=0)
+        lines = output.splitlines()
+
+        # Track per-file stats while scanning real diff
+        file_stats: dict[str, dict[str, int]] = {}
+        current_file: Optional[str] = None
+        stat_rows: list[tuple[str, str]] = []  # (path, marker)
+        summary_files = 0
+        summary_add = 0
+        summary_del = 0
+
+        for raw in lines:
+            # --stat style: `path | N +++---`
+            m_stat = self.STAT_RE.match(raw)
+            if m_stat and "|" in raw:
+                stat_rows.append((m_stat.group(1), raw.strip()))
+                continue
+
+            # Summary line `N files changed, X insertions(+), Y deletions(-)`
+            m_sum = self.STAT_SUMMARY_RE.search(raw)
+            if m_sum and raw.strip().endswith(("(+)", "(-)", "changed")):
+                summary_files = int(m_sum.group(1))
+                summary_add = int(m_sum.group(2) or 0)
+                summary_del = int(m_sum.group(3) or 0)
+                continue
+
+            # File header
+            m_file = self.FILE_RE.match(raw)
+            if m_file:
+                current_file = m_file.group(2)
+                file_stats.setdefault(current_file, {"add": 0, "del": 0, "status": "M"})
+                continue
+
+            if current_file:
+                if self.NEW_FILE_RE.match(raw):
+                    file_stats[current_file]["status"] = "A"
+                    continue
+                if self.DEL_FILE_RE.match(raw):
+                    file_stats[current_file]["status"] = "D"
+                    continue
+                # Count diff lines (skip hunk/file headers)
+                if raw.startswith("+") and not raw.startswith("+++"):
+                    file_stats[current_file]["add"] += 1
+                elif raw.startswith("-") and not raw.startswith("---"):
+                    file_stats[current_file]["del"] += 1
+
+        if file_stats:
+            total_add = sum(v["add"] for v in file_stats.values())
+            total_del = sum(v["del"] for v in file_stats.values())
+            result.extra["git_diff_files"] = [
+                (path, v["status"], v["add"], v["del"])
+                for path, v in file_stats.items()
+            ]
+            result.extra["git_diff_totals"] = (len(file_stats), total_add, total_del)
+        elif stat_rows:
+            result.extra["git_diff_stat_rows"] = stat_rows
+            result.extra["git_diff_totals"] = (summary_files or len(stat_rows), summary_add, summary_del)
+        else:
+            result.extra["git_diff_totals"] = (0, 0, 0)
+
+        result.total = result.extra["git_diff_totals"][0]
+        return result
+
+
+class GitLogParser(Parser):
+    """Parse `git log` output. Extracts one line per commit (hash + subject)."""
+
+    COMMIT_RE = re.compile(r"^commit ([0-9a-f]{7,40})")
+    ONELINE_RE = re.compile(r"^([0-9a-f]{7,40})\s+(.+)$")
+    SUBJECT_INDENT_RE = re.compile(r"^ {4}(\S.*)$")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="git_log", exit_code=0, duration=0)
+        lines = output.splitlines()
+        entries: list[tuple[str, str]] = []
+
+        current_hash = ""
+        current_subject = ""
+        full_format = False
+
+        for raw in lines:
+            m_commit = self.COMMIT_RE.match(raw)
+            if m_commit:
+                full_format = True
+                if current_hash and current_subject:
+                    entries.append((current_hash, current_subject))
+                current_hash = m_commit.group(1)[:7]
+                current_subject = ""
+                continue
+
+            if full_format:
+                m_subject = self.SUBJECT_INDENT_RE.match(raw)
+                if m_subject and not current_subject:
+                    current_subject = m_subject.group(1).strip()
+                continue
+
+            # Oneline format
+            m_oneline = self.ONELINE_RE.match(raw)
+            if m_oneline:
+                h = m_oneline.group(1)[:7]
+                entries.append((h, m_oneline.group(2).strip()))
+
+        if full_format and current_hash and current_subject:
+            entries.append((current_hash, current_subject))
+
+        result.total = len(entries)
+        result.extra["git_log_entries"] = entries
+        return result
+
+
+class GitWriteParser(Parser):
+    """Parse mutating git commands (add/commit/push/pull/fetch/...).
+
+    Produces a 1-line summary — never needs more.
+    """
+
+    COMMIT_HASH_RE = re.compile(r"^\[(\S+)\s+(?:\(root-commit\)\s+)?([0-9a-f]{7,40})\]\s+(.+)$")
+    COMMIT_CHANGE_RE = re.compile(r"^\s*(\d+)\s+files?\s+changed")
+    PUSH_SUMMARY_RE = re.compile(r"^\s*([0-9a-f]+)\.\.([0-9a-f]+)\s+(\S+)\s+->\s+(\S+)")
+    PULL_UPDATING_RE = re.compile(r"^Updating\s+([0-9a-f]+)\.\.([0-9a-f]+)")
+    FAST_FORWARD_RE = re.compile(r"^Fast-forward")
+    ALREADY_UP_RE = re.compile(r"^Already up to date")
+    NOTHING_COMMIT_RE = re.compile(r"^nothing to commit")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="git_write", exit_code=0, duration=0)
+        lines = output.splitlines()
+        summary = ""
+        files_changed = 0
+
+        for raw in lines:
+            m_commit = self.COMMIT_HASH_RE.match(raw)
+            if m_commit:
+                branch = m_commit.group(1)
+                sha = m_commit.group(2)[:7]
+                msg = m_commit.group(3)
+                summary = f"commit {sha} on {branch}: {msg}"
+                continue
+
+            m_change = self.COMMIT_CHANGE_RE.match(raw)
+            if m_change:
+                files_changed = int(m_change.group(1))
+                continue
+
+            m_push = self.PUSH_SUMMARY_RE.match(raw)
+            if m_push:
+                summary = f"pushed {m_push.group(1)[:7]}..{m_push.group(2)[:7]} {m_push.group(3)} -> {m_push.group(4)}"
+                continue
+
+            m_pull = self.PULL_UPDATING_RE.match(raw)
+            if m_pull:
+                summary = f"updating {m_pull.group(1)[:7]}..{m_pull.group(2)[:7]}"
+                continue
+
+            if self.ALREADY_UP_RE.match(raw):
+                summary = "already up to date"
+                continue
+
+            if self.NOTHING_COMMIT_RE.match(raw):
+                summary = "nothing to commit"
+                continue
+
+        if files_changed and summary.startswith("commit"):
+            summary += f" ({files_changed} files)"
+
+        if not summary:
+            # Fallback: first non-blank line
+            for raw in lines:
+                if raw.strip():
+                    summary = raw.strip()[:180]
+                    break
+
+        result.extra["git_write_summary"] = summary or "done"
+        return result
+
+
+class DockerPsParser(Parser):
+    """Parse `docker ps` / `docker images` output.
+
+    Handles default tabular format. Extracts ID, IMAGE, STATUS, PORTS, NAME.
+    """
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="docker_ps", exit_code=0, duration=0)
+        lines = [l for l in output.splitlines() if l.strip()]
+        if not lines:
+            result.extra["docker_rows"] = []
+            result.extra["docker_kind"] = "ps"
+            return result
+
+        header = lines[0]
+        # Detect column positions by finding start of each known header
+        cols = self._column_positions(header)
+        kind = "images" if "REPOSITORY" in header else "ps"
+
+        rows: list[dict[str, str]] = []
+        for line in lines[1:]:
+            row = self._split_by_positions(line, cols)
+            rows.append(row)
+
+        # Count running vs exited for `ps -a`
+        running = 0
+        stopped = 0
+        for row in rows:
+            status = row.get("STATUS", "")
+            if status.startswith("Up"):
+                running += 1
+            elif status.startswith(("Exited", "Created", "Dead", "Restarting")):
+                stopped += 1
+
+        result.total = len(rows)
+        result.extra["docker_rows"] = rows
+        result.extra["docker_kind"] = kind
+        result.extra["docker_running"] = running
+        result.extra["docker_stopped"] = stopped
+        return result
+
+    @staticmethod
+    def _column_positions(header: str) -> list[tuple[str, int]]:
+        """Return list of (column_name, start_position)."""
+        positions: list[tuple[str, int]] = []
+        i = 0
+        while i < len(header):
+            if header[i] == " ":
+                i += 1
+                continue
+            start = i
+            # Advance to end of column name (2+ spaces = separator)
+            while i < len(header):
+                if header[i] == " " and (i + 1 < len(header) and header[i + 1] == " "):
+                    break
+                i += 1
+            name = header[start:i].strip()
+            if name:
+                positions.append((name, start))
+        return positions
+
+    @staticmethod
+    def _split_by_positions(line: str, cols: list[tuple[str, int]]) -> dict[str, str]:
+        row: dict[str, str] = {}
+        for idx, (name, start) in enumerate(cols):
+            end = cols[idx + 1][1] if idx + 1 < len(cols) else len(line)
+            row[name] = line[start:end].strip()
+        return row
+
+
+class GrepRgParser(Parser):
+    """Parse grep/rg/ag output. Groups matches by file, caps per-file and total."""
+
+    # file:line:content (grep -n, rg default)
+    FILE_LINE_RE = re.compile(r"^([^:\x00]+?):(\d+):(.*)$")
+    # file-line-content (grep -C context lines)
+    FILE_LINE_DASH_RE = re.compile(r"^([^:\x00]+?)-(\d+)-(.*)$")
+    # line:content only (single-file grep without -H)
+    LINE_ONLY_RE = re.compile(r"^(\d+):(.*)$")
+    # rg --count format: file:count
+    COUNT_RE = re.compile(r"^([^:\x00]+?):(\d+)$")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="grep", exit_code=0, duration=0)
+        lines = output.splitlines()
+        by_file: dict[str, list[tuple[int, str]]] = {}
+        unmatched: list[str] = []
+
+        for raw in lines:
+            if not raw.strip():
+                continue
+            # Try file:line:content first (most common: grep -rn, rg default)
+            m = self.FILE_LINE_RE.match(raw)
+            if m and not m.group(1).isdigit():
+                path = m.group(1)
+                # Reject if path contains impossible chars (likely a content line)
+                if "\t" not in path:
+                    lineno = int(m.group(2))
+                    content = m.group(3)
+                    by_file.setdefault(path, []).append((lineno, content))
+                    continue
+
+            # line:content only (single file without -H or stdin)
+            m_line = self.LINE_ONLY_RE.match(raw)
+            if m_line:
+                lineno = int(m_line.group(1))
+                content = m_line.group(2)
+                by_file.setdefault("(stdin)", []).append((lineno, content))
+                continue
+
+            m_dash = self.FILE_LINE_DASH_RE.match(raw)
+            if m_dash and not m_dash.group(1).isdigit():
+                path = m_dash.group(1)
+                lineno = int(m_dash.group(2))
+                by_file.setdefault(path, []).append((lineno, m_dash.group(3)))
+                continue
+
+            # Fallback: file:content (no line number, rg with --no-line-number)
+            if ":" in raw:
+                path, _, content = raw.partition(":")
+                if path and not path.isdigit() and "/" in path or path.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".rb", ".c", ".cpp", ".h", ".md", ".txt", ".yml", ".yaml", ".json", ".toml", ".lock")):
+                    by_file.setdefault(path, []).append((0, content))
+                    continue
+
+            unmatched.append(raw)
+
+        total_matches = sum(len(v) for v in by_file.values())
+        result.total = total_matches
+        result.extra["grep_by_file"] = by_file
+        result.extra["grep_total"] = total_matches
+        result.extra["grep_unmatched"] = unmatched[: config.max_lines]
+        return result
+
+
+class LsTreeParser(Parser):
+    """Parse `ls -l` / `ls -la` / `tree` output. Strips noise, caps entries."""
+
+    # `ls -l`: perms links owner group size date time name
+    LS_LONG_RE = re.compile(
+        r"^([dlcbps\-])([rwx\-stST]{9}[@+]?)\s+\d+\s+\S+\s+\S+\s+"
+        r"(\S+)\s+"  # size
+        r"(\S+\s+\S+\s+\S+)\s+"  # date time
+        r"(.+)$"
+    )
+    # `tree` output has prefix chars ├── │   └──
+    TREE_PREFIX_RE = re.compile(r"^([│├└─\s]+)(.*)$")
+    NOISE_DIRS = {
+        "node_modules", ".git", "__pycache__", ".venv", "venv",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist",
+        "build", ".next", ".nuxt", "target", ".idea", ".vscode",
+    }
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="ls_tree", exit_code=0, duration=0)
+        lines = output.splitlines()
+        entries: list[tuple[str, str]] = []  # (kind, display)
+        hidden = 0
+        is_tree = any(self.TREE_PREFIX_RE.match(l) and ("├" in l or "└" in l) for l in lines[:20])
+
+        if is_tree:
+            # tree output ends with line like "2 directories, 5 files" — skip it
+            tree_summary_re = re.compile(r"^\d+\s+director(?:y|ies),\s+\d+\s+files?$")
+            for raw in lines:
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                if tree_summary_re.match(stripped):
+                    continue
+                m = self.TREE_PREFIX_RE.match(raw)
+                if not m:
+                    entries.append(("", raw))
+                    continue
+                name = m.group(2).strip()
+                if not name:
+                    continue
+                # Hide noise subtrees entirely
+                if any(n in name for n in self.NOISE_DIRS):
+                    hidden += 1
+                    continue
+                entries.append(("", m.group(1) + name))
+        else:
+            for raw in lines:
+                stripped = raw.strip()
+                if not stripped or stripped.startswith("total "):
+                    continue
+                m_long = self.LS_LONG_RE.match(stripped)
+                if m_long:
+                    type_char = m_long.group(1)
+                    size = m_long.group(3)
+                    name = m_long.group(5)
+                    kind = {"d": "D", "l": "L"}.get(type_char, "F")
+                    if name.split(" -> ")[0].strip() in self.NOISE_DIRS:
+                        hidden += 1
+                        continue
+                    # Compact: D size name (skip perms/owner/date)
+                    entries.append((kind, f"{kind} {size:>8} {name}"))
+                else:
+                    # Short ls: just names
+                    for tok in raw.split():
+                        if tok in self.NOISE_DIRS:
+                            hidden += 1
+                            continue
+                        entries.append(("", tok))
+
+        result.total = len(entries)
+        result.extra["ls_entries"] = entries
+        result.extra["ls_hidden"] = hidden
+        result.extra["ls_is_tree"] = is_tree
+        return result
+
+
 class GenericParser(Parser):
     """Smart fallback: extract error-relevant lines instead of blind head+tail."""
 
@@ -829,6 +1395,13 @@ PARSERS: dict[str, Parser] = {
     "tsc": TscParser(),
     "mypy": TscParser(),  # Similar format
     "ty": TscParser(),
+    "git_status": GitStatusParser(),
+    "git_diff": GitDiffParser(),
+    "git_log": GitLogParser(),
+    "git_write": GitWriteParser(),
+    "docker_ps": DockerPsParser(),
+    "grep": GrepRgParser(),
+    "ls_tree": LsTreeParser(),
     "generic": GenericParser(),
 }
 
@@ -836,8 +1409,272 @@ PARSERS: dict[str, Parser] = {
 # ─── Formatter ────────────────────────────────────────────────────────────────
 
 
+def _meta_line(tool: str, exit_code: int, *extras: str) -> str:
+    parts = [f"exit:{exit_code}", tool, *[e for e in extras if e]]
+    return " | ".join(parts)
+
+
+def _format_git_status(result: Result, config: Config) -> str:
+    parts: list[str] = []
+    branch = result.extra.get("git_branch", "")
+    counts = result.extra.get("git_status_counts", {})
+    entries = result.extra.get("git_status_entries", [])
+
+    summary_bits: list[str] = []
+    # Human-friendly rollup: M=modified, A=added, D=deleted, ??=untracked, U*=conflict
+    label_map = {"M": "modified", "A": "added", "D": "deleted", "R": "renamed",
+                 "C": "copied", "?": "untracked", "U": "conflict", "T": "typechange"}
+    for code, label in label_map.items():
+        total = sum(n for k, n in counts.items() if code in k)
+        if total:
+            summary_bits.append(f"{total} {label}")
+
+    if not entries:
+        summary_bits.append("clean")
+
+    meta = _meta_line("git_status", result.exit_code,
+                      f"on {branch}" if branch else "",
+                      ", ".join(summary_bits))
+    parts.append(meta)
+
+    shown = entries[: config.max_failures * 3] if config.max_failures else entries
+    for xy, path in shown:
+        parts.append(f"{xy} {path}")
+    remaining = len(entries) - len(shown)
+    if remaining > 0:
+        parts.append(f"+{remaining} more entries")
+
+    if result.raw_output_path:
+        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    return "\n".join(parts)
+
+
+def _format_git_diff(result: Result, config: Config) -> str:
+    parts: list[str] = []
+    totals = result.extra.get("git_diff_totals", (0, 0, 0))
+    n_files, adds, dels = totals
+    meta = _meta_line("git_diff", result.exit_code,
+                      f"{n_files} file{'s' if n_files != 1 else ''}" if n_files else "no changes",
+                      f"+{adds} -{dels}" if (adds or dels) else "")
+    parts.append(meta)
+
+    files = result.extra.get("git_diff_files", [])
+    stat_rows = result.extra.get("git_diff_stat_rows", [])
+
+    if files:
+        shown = files[: config.max_failures * 2]
+        for path, status, add, rem in shown:
+            parts.append(f"{status} {path} +{add} -{rem}")
+        remaining = len(files) - len(shown)
+        if remaining > 0:
+            parts.append(f"+{remaining} more files")
+    elif stat_rows:
+        shown = stat_rows[: config.max_failures * 2]
+        for _, row in shown:
+            parts.append(row)
+        remaining = len(stat_rows) - len(shown)
+        if remaining > 0:
+            parts.append(f"+{remaining} more files")
+
+    if result.raw_output_path:
+        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    return "\n".join(parts)
+
+
+def _format_git_log(result: Result, config: Config) -> str:
+    parts: list[str] = []
+    entries = result.extra.get("git_log_entries", [])
+    meta = _meta_line("git_log", result.exit_code,
+                      f"{len(entries)} commit{'s' if len(entries) != 1 else ''}")
+    parts.append(meta)
+
+    cap = max(20, config.max_failures * 2)
+    shown = entries[:cap]
+    for sha, subject in shown:
+        subj = subject if len(subject) <= 120 else subject[:117] + "..."
+        parts.append(f"{sha} {subj}")
+    remaining = len(entries) - len(shown)
+    if remaining > 0:
+        parts.append(f"+{remaining} more commits")
+
+    if result.raw_output_path:
+        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    return "\n".join(parts)
+
+
+def _format_git_write(result: Result, config: Config) -> str:
+    summary = result.extra.get("git_write_summary", "")
+    return _meta_line("git_write", result.exit_code, summary)
+
+
+def _format_docker_ps(result: Result, config: Config) -> str:
+    parts: list[str] = []
+    rows = result.extra.get("docker_rows", [])
+    kind = result.extra.get("docker_kind", "ps")
+    running = result.extra.get("docker_running", 0)
+    stopped = result.extra.get("docker_stopped", 0)
+
+    if kind == "images":
+        summary = f"{len(rows)} image{'s' if len(rows) != 1 else ''}"
+    else:
+        parts_summary = []
+        if running:
+            parts_summary.append(f"{running} running")
+        if stopped:
+            parts_summary.append(f"{stopped} stopped")
+        if not parts_summary:
+            parts_summary.append(f"{len(rows)} container{'s' if len(rows) != 1 else ''}")
+        summary = ", ".join(parts_summary)
+
+    parts.append(_meta_line("docker_ps", result.exit_code, summary))
+
+    cap = max(15, config.max_failures)
+    shown = rows[:cap]
+
+    for row in shown:
+        if kind == "images":
+            repo = row.get("REPOSITORY", "")
+            tag = row.get("TAG", "")
+            img_id = row.get("IMAGE ID", "")[:12]
+            size = row.get("SIZE", "")
+            parts.append(f"{img_id} {repo}:{tag} {size}")
+            continue
+
+        cid = row.get("CONTAINER ID", "")[:12]
+        image = row.get("IMAGE", "")
+        status = row.get("STATUS", "")
+        ports = row.get("PORTS", "")
+        name = row.get("NAMES", "")
+        # Compact ports: "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp" → ":8080"
+        if ports:
+            # Strip IPv4 and IPv6 host parts, keep host port only
+            compact_ports = re.sub(r"(?:[\d.]+|\[::\]):(\d+)->\d+/\w+", r":\1", ports)
+            # Deduplicate consecutive same ports (IPv4 + IPv6 of same port)
+            compact_ports = re.sub(r"(:\d+),\s*\1(?=[,\s]|$)", r"\1", compact_ports)
+            compact_ports = re.sub(r",\s+", ",", compact_ports)
+            if len(compact_ports) > 60:
+                compact_ports = compact_ports[:57] + "..."
+        else:
+            compact_ports = "-"
+        # Compact status: "Up 2 hours (healthy)" keep, drop "Exited (0) 3 days ago" → "Exited"
+        compact_status = status
+        if len(compact_status) > 30:
+            compact_status = compact_status[:27] + "..."
+        parts.append(f"{cid} {name} {image} {compact_status} {compact_ports}")
+
+    remaining = len(rows) - len(shown)
+    if remaining > 0:
+        parts.append(f"+{remaining} more")
+
+    if result.raw_output_path:
+        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    return "\n".join(parts)
+
+
+def _format_grep(result: Result, config: Config) -> str:
+    parts: list[str] = []
+    by_file = result.extra.get("grep_by_file", {})
+    total = result.extra.get("grep_total", 0)
+    unmatched = result.extra.get("grep_unmatched", [])
+
+    if total == 0 and not unmatched:
+        parts.append(_meta_line("grep", result.exit_code, "no matches"))
+        return "\n".join(parts)
+
+    parts.append(_meta_line("grep", result.exit_code,
+                            f"{total} match{'es' if total != 1 else ''} in {len(by_file)} file{'s' if len(by_file) != 1 else ''}"))
+
+    max_total = max(50, config.max_lines * 4)
+    max_per_file = 10
+    shown_total = 0
+    files_shown = 0
+    # Sort by match count desc for signal-first
+    sorted_files = sorted(by_file.items(), key=lambda x: -len(x[1]))
+
+    for path, matches in sorted_files:
+        if shown_total >= max_total:
+            break
+        files_shown += 1
+        parts.append(f"{path} ({len(matches)}):")
+        per_file_cap = min(max_per_file, max_total - shown_total)
+        for lineno, content in matches[:per_file_cap]:
+            text = content.strip()
+            if len(text) > 140:
+                text = text[:137] + "..."
+            parts.append(f"  {lineno}: {text}")
+        shown_total += min(per_file_cap, len(matches))
+        if len(matches) > per_file_cap:
+            parts.append(f"  +{len(matches) - per_file_cap} more in file")
+
+    remaining_files = len(by_file) - files_shown
+    if remaining_files > 0:
+        remaining_matches = sum(len(v) for _, v in sorted_files[files_shown:])
+        parts.append(f"+{remaining_files} more files ({remaining_matches} matches)")
+
+    if unmatched:
+        for line in unmatched[:3]:
+            parts.append(line[:180])
+
+    if result.raw_output_path:
+        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    return "\n".join(parts)
+
+
+def _format_ls_tree(result: Result, config: Config) -> str:
+    parts: list[str] = []
+    entries = result.extra.get("ls_entries", [])
+    hidden = result.extra.get("ls_hidden", 0)
+    is_tree = result.extra.get("ls_is_tree", False)
+
+    kinds: dict[str, int] = {}
+    for kind, _ in entries:
+        kinds[kind] = kinds.get(kind, 0) + 1
+    summary_bits = []
+    if kinds.get("D"):
+        summary_bits.append(f"{kinds['D']} dirs")
+    if kinds.get("F"):
+        summary_bits.append(f"{kinds['F']} files")
+    if kinds.get("L"):
+        summary_bits.append(f"{kinds['L']} links")
+    if not summary_bits:
+        summary_bits.append(f"{len(entries)} entries")
+    if hidden:
+        summary_bits.append(f"{hidden} noise hidden")
+
+    tool_name = "tree" if is_tree else "ls"
+    parts.append(_meta_line(tool_name, result.exit_code, ", ".join(summary_bits)))
+
+    cap = max(40, config.max_lines * 3)
+    shown = entries[:cap]
+    for _, display in shown:
+        parts.append(display)
+    remaining = len(entries) - len(shown)
+    if remaining > 0:
+        parts.append(f"+{remaining} more entries")
+
+    if result.raw_output_path:
+        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    return "\n".join(parts)
+
+
 def format_result(result: Result, config: Config, raw_output: str) -> str:
     """Format the parsed result into maximum token-efficient output for LLM."""
+    # Dispatch to specialized formatters for non-test tools
+    if result.tool == "git_status":
+        return _format_git_status(result, config)
+    if result.tool == "git_diff":
+        return _format_git_diff(result, config)
+    if result.tool == "git_log":
+        return _format_git_log(result, config)
+    if result.tool == "git_write":
+        return _format_git_write(result, config)
+    if result.tool == "docker_ps":
+        return _format_docker_ps(result, config)
+    if result.tool == "grep":
+        return _format_grep(result, config)
+    if result.tool == "ls_tree":
+        return _format_ls_tree(result, config)
+
     parts: list[str] = []
 
     # ── Summary line: exit:N | tool | counts | duration ──
