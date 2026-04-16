@@ -71,6 +71,7 @@ ANSI_RE = re.compile(
     r"|]8;;[^\x07\x1b]*(?:\x07|\x1b\\|\\\\|\s)"  # Residual OSC 8 hyperlinks after partial strip
 )
 DECORATIVE_RE = re.compile(r"^[\s=\-_~*]{3,}\s*$")
+_TRUNCATION_RE = re.compile(r"\+\d+ more\b|\.\.\. \(\d+")
 PROGRESS_RE = re.compile(r"^\s*[\|/\\\-]\s|^\s*\d+%\s*[\|█▓▒░]|^\.{4,}$")
 TIMESTAMP_ONLY_RE = re.compile(r"^\[?\d{4}[-/]\d{2}[-/]\d{2}[\sT]\d{2}:\d{2}:\d{2}[^\]]*\]?\s*$")
 
@@ -1432,6 +1433,27 @@ def _meta_line(tool: str, exit_code: int, *extras: str) -> str:
     return " | ".join(parts)
 
 
+def _maybe_full_path(parts: list[str], result: Result) -> None:
+    """Append `full: <path>` only when the pointer is useful.
+
+    Useful when:
+      - Any rendered line shows an explicit truncation marker (`+N more`, `... (N`),
+      - Raw log has materially more lines than what was rendered (>10 lines hidden),
+      - Non-zero exit with substantial raw output (>2 KB) — agent likely investigates.
+
+    The raw log is still saved to disk; we just stop announcing it when
+    everything relevant is already on screen.
+    """
+    if not result.raw_output_path:
+        return
+    truncated = any(_TRUNCATION_RE.search(p) for p in parts)
+    much_hidden = result.raw_line_count > len(parts) + 10
+    failed_verbose = result.exit_code != 0 and result.raw_byte_count > 2048
+    if truncated or much_hidden or failed_verbose:
+        display = result.raw_output_path.replace(str(Path.home()), "~")
+        parts.append(f"full: {display}")
+
+
 def _format_git_status(result: Result, config: Config) -> str:
     parts: list[str] = []
     branch = result.extra.get("git_branch", "")
@@ -1462,8 +1484,7 @@ def _format_git_status(result: Result, config: Config) -> str:
     if remaining > 0:
         parts.append(f"+{remaining} more entries")
 
-    if result.raw_output_path:
-        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    _maybe_full_path(parts, result)
     return "\n".join(parts)
 
 
@@ -1494,8 +1515,7 @@ def _format_git_diff(result: Result, config: Config) -> str:
         if remaining > 0:
             parts.append(f"+{remaining} more files")
 
-    if result.raw_output_path:
-        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    _maybe_full_path(parts, result)
     return "\n".join(parts)
 
 
@@ -1515,8 +1535,7 @@ def _format_git_log(result: Result, config: Config) -> str:
     if remaining > 0:
         parts.append(f"+{remaining} more commits")
 
-    if result.raw_output_path:
-        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    _maybe_full_path(parts, result)
     return "\n".join(parts)
 
 
@@ -1584,8 +1603,7 @@ def _format_docker_ps(result: Result, config: Config) -> str:
     if remaining > 0:
         parts.append(f"+{remaining} more")
 
-    if result.raw_output_path:
-        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    _maybe_full_path(parts, result)
     return "\n".join(parts)
 
 
@@ -1635,8 +1653,7 @@ def _format_grep(result: Result, config: Config) -> str:
         for line in unmatched[:3]:
             parts.append(line[:180])
 
-    if result.raw_output_path:
-        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    _maybe_full_path(parts, result)
     return "\n".join(parts)
 
 
@@ -1672,8 +1689,7 @@ def _format_ls_tree(result: Result, config: Config) -> str:
     if remaining > 0:
         parts.append(f"+{remaining} more entries")
 
-    if result.raw_output_path:
-        parts.append(f"full: {result.raw_output_path.replace(str(Path.home()), '~')}")
+    _maybe_full_path(parts, result)
     return "\n".join(parts)
 
 
@@ -1809,10 +1825,7 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
     # ── Footer: fixable hint + full output path ──
     if "fixable" in result.extra:
         parts.append(f"{result.extra['fixable']} fixable with --fix")
-    if result.raw_output_path:
-        # Shorten path with ~ for home directory
-        display_path = result.raw_output_path.replace(str(Path.home()), "~")
-        parts.append(f"full: {display_path}")
+    _maybe_full_path(parts, result)
 
     return "\n".join(parts)
 

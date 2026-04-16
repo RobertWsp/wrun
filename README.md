@@ -8,7 +8,7 @@ AI coding agents (Claude Code, OpenCode, Cursor, etc.) waste context window on v
 
 wrun sits between the agent and the tool: it runs the command, parses the output with a tool-specific parser, and emits a canonical one-line-summary + compact details format the agent can act on without rereading the whole blob.
 
-Nothing is lost — the full output is saved to `~/.local/share/wrun/*.log` and a `full: path` pointer is included in every response.
+Nothing is lost — the full output is always saved to `~/.local/share/wrun/*.log`. A `full: <path>` pointer is appended only when it adds value: when output was truncated, when the raw log has materially more lines than what was rendered, or when a non-zero exit produced substantial output. Compact, complete responses (e.g. `exit:0 | git_status | clean`) stay clean — no noisy pointer.
 
 ## Install
 
@@ -267,7 +267,7 @@ Selected cases (bytes in → bytes out):
 - **Already-compact output adds a canonical header** (`--porcelain`, `--oneline`, single-file grep, empty diff). The `exit:N | tool | summary` line is 20–70 extra bytes, but gives the agent a one-glance answer without reparsing.
 - **`--quiet` compresses to one line regardless of failure count** (99% on pytest with 3 failures).
 - **Empty output becomes informative**: `git diff` with no changes produces 0 bytes raw vs `exit:0 | git_diff | no changes` in wrun. The agent can now distinguish "no diff" from "silent failure".
-- **Full output is never lost** — pointer to the complete log is appended when output exceeds a few lines.
+- **Full output is never lost** — the raw log is always written to `~/.local/share/wrun/*.log`. The `full: <path>` pointer is appended only when output was truncated, materially reduced vs raw, or came from a failing command (exit ≠ 0 with >2 KB raw). Clean, compact responses don't carry the pointer.
 
 ## Edge cases covered
 
