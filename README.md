@@ -224,29 +224,72 @@ E501 x1: Line too long [src/util.py:88]
 3 fixable with --fix
 ```
 
-## Measured reduction — 23-case audit
+## Measured reduction — 31-case harness
 
-Ran every parser against real commands in a realistic test repo. Numbers are raw bytes vs wrun bytes.
+`tests/harness.py` runs every parser against synthetic + real commands and asserts structural expectations (field presence, counts, line numbers, flags). Run it with:
+
+```bash
+python3 tests/harness.py
+```
+
+Current result:
+
+```
+Total: 31 | PASS: 31 | FAIL: 0
+Aggregated: 28 935 B → 4 858 B  (−84%)
+```
+
+Selected cases (bytes in → bytes out):
 
 | Case | Raw | Wrun | Δ |
 |---|---:|---:|---:|
-| `docker ps` (33 containers) | 11 792 B | 1 351 B | **−89%** |
-| `git log` (default) | 623 B | 148 B | **−77%** |
-| `git commit` | 192 B | 35 B | **−82%** |
-| `ls -la` (with noise) | 529 B | 119 B | **−78%** |
-| `git diff HEAD` | 513 B | 113 B | **−78%** |
-| `git status` (human, multi-state) | 302 B | 176 B | **−42%** |
-| `tree -L 2` (with noise) | 343 B | 269 B | **−22%** |
-| `git log --graph --oneline` | 129 B | 148 B | +14% |
-| `git status --porcelain` (already compact) | 19 B | 53 B | +178% |
-| `grep -rn` multi-file (few matches) | 78 B | 122 B | +56% |
-| **OVERALL (23 cases aggregated)** | **14 370 B** | **3 221 B** | **−78%** |
+| `docker ps` (33 containers, live) | 11 792 B | 1 351 B | **−89%** |
+| pytest 3-failure fixture | 2 462 B | 310 B | **−88%** |
+| pytest 3-failure + `--quiet` | 2 462 B | 45 B | **−99%** |
+| pytest 3-failure + `--max-failures=1` | 2 462 B | 155 B | **−94%** |
+| pytest `--json` | 2 462 B | 563 B | **−78%** |
+| vitest 2-failure fixture | 1 291 B | 538 B | **−59%** |
+| tsc 4 errors / 3 files | 516 B | 273 B | **−48%** |
+| ruff classic 6 errors | 359 B | 255 B | **−29%** |
+| ruff modern Rust-style | 392 B | 156 B | **−61%** |
+| ls -la with noise dirs | 268 B | 82 B | **−70%** |
+| tree with deep noise subtrees | 194 B | 123 B | **−37%** |
+| git diff (2-file fixture) | 274 B | 70 B | **−75%** |
+| git log (graph fixture) | 93 B | 109 B | +17% |
+| git status porcelain (already compact) | 34 B | 89 B | +161% |
+| grep multi-file (few matches) | 65 B | 107 B | +64% |
+| `grep -Hn` self-source (real) | 4 247 B | 658 B | **−85%** |
+| generic error-pattern extraction | 190 B | 205 B | +8% |
+| 10 KB minified-style long line | 10 008 B | 521 B | **−95%** |
 
 **Observations**:
-- **Verbose output wins big** (70–90% reduction). This is the common AI-agent case: `docker ps`, `git log`, `ls -la`, `git diff HEAD`, `pytest` with failures.
-- **Already-compact output adds a header** (`--porcelain`, `--oneline`, single-file grep, empty diff). The canonical `exit:N | tool | summary` line is 20–70 extra bytes, but it gives the agent a one-glance answer ("is it passing?", "how many changes?") without reparsing.
+- **Verbose output wins big** (60–99% reduction). This is the common AI-agent case: `docker ps`, `git log`, `ls -la`, `git diff`, `pytest` with failures, long build logs.
+- **Already-compact output adds a canonical header** (`--porcelain`, `--oneline`, single-file grep, empty diff). The `exit:N | tool | summary` line is 20–70 extra bytes, but gives the agent a one-glance answer without reparsing.
+- **`--quiet` compresses to one line regardless of failure count** (99% on pytest with 3 failures).
 - **Empty output becomes informative**: `git diff` with no changes produces 0 bytes raw vs `exit:0 | git_diff | no changes` in wrun. The agent can now distinguish "no diff" from "silent failure".
 - **Full output is never lost** — pointer to the complete log is appended when output exceeds a few lines.
+
+## Edge cases covered
+
+The harness exercises and validates:
+
+| Edge case | Behavior |
+|---|---|
+| Empty input (stdin mode) | Emits `exit:0` summary, no error |
+| Heavy ANSI CSI codes | Stripped; content preserved |
+| OSC 8 hyperlinks (ruff modern) | Stripped; URL not echoed |
+| Unicode + emoji (`💥`, `测试`, `ação`) | Preserved byte-for-byte |
+| 10 KB single line (minified JS / base64) | Detected if it contains `error/ERROR`; truncated at 500 chars |
+| Command not found (`execve` fails) | `exit:127` |
+| `git commit` with global flags (`git -c k=v commit`) | Subcommand detected correctly (skips `-c k=v`) |
+| `docker ps` IPv4 + IPv6 port pairs | Deduplicated (`0.0.0.0:80, [::]:80` → `:80`) |
+| `rg` without line numbers (`--no-line-number`) | Matches grouped under `(match)` |
+| `rg` single-file (no path prefix) | Same — no raw pass-through |
+| `tree` with noise subtrees (`node_modules`, `.git`) | Entire subtree pruned (indent-aware) |
+| `ls -la` with `.` and `..` entries | Hidden along with noise dirs |
+| `git log --graph --oneline` | Graph prefix chars (`*|/\_`) stripped before hash match |
+| pytest all-passing one-liner | Duration captured despite trailing `=` |
+| Quiet mode with non-zero exit | One-line summary only (no details) |
 
 ## Optimization techniques
 

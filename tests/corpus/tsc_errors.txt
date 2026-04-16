@@ -1,0 +1,14 @@
+src/api.ts(12,5): error TS2322: Type 'string' is not assignable to type 'number'.
+src/api.ts(42,10): error TS2339: Property 'foo' does not exist on type 'User'.
+src/db.ts(8,3): error TS2769: No overload matches this call.
+  Overload 1 of 2, '(s: string): User', gave the following error.
+    Argument of type 'number' is not assignable to parameter of type 'string'.
+src/util.ts(100,1): error TS1005: ';' expected.
+
+
+Found 4 errors in 3 files.
+
+Errors  Files
+     2  src/api.ts
+     1  src/db.ts
+     1  src/util.ts

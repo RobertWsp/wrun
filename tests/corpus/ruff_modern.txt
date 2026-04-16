@@ -1,0 +1,17 @@
+warning: `ruff check` has been replaced with `ruff check .`. Please update your command.
+src/api.py:1:1: F401 [*] `os` imported but unused
+  |
+1 | import os
+  | ^^^^^^^^^ F401
+  |
+  = help: Remove unused import: `os`
+
+src/api.py:15:1: E302 Expected 2 blank lines, found 1
+   |
+13 | def foo():
+14 |     pass
+15 | def bar():
+   | ^^^^ E302
+
+Found 2 errors.
+[*] 1 fixable with the --fix option.

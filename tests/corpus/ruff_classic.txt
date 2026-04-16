@@ -1,0 +1,8 @@
+src/api.py:1:1: F401 `os` imported but unused
+src/api.py:15:1: E302 expected 2 blank lines, found 1
+src/db.py:1:1: F401 `os` imported but unused
+src/db.py:22:1: E302 expected 2 blank lines, found 1
+src/util.py:1:1: F401 `os` imported but unused
+src/util.py:88:80: E501 line too long (95 > 79 characters)
+Found 6 errors.
+[*] 3 fixable with the `--fix` option.

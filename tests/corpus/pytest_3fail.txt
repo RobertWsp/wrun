@@ -1,0 +1,49 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.12, pytest-9.0.2, pluggy-1.6.0
+rootdir: /home/user/project
+plugins: anyio-4.12.1, cov-7.0.0
+collecting ... collected 11 items
+
+tests/test_auth.py::test_login FAILED                                    [  9%]
+tests/test_auth.py::test_logout PASSED                                   [ 18%]
+tests/test_auth.py::test_token PASSED                                    [ 27%]
+tests/test_db.py::test_connect PASSED                                    [ 36%]
+tests/test_db.py::test_query FAILED                                      [ 45%]
+tests/test_db.py::test_insert PASSED                                     [ 54%]
+tests/test_db.py::test_update PASSED                                     [ 63%]
+tests/test_db.py::test_delete PASSED                                     [ 72%]
+tests/test_api.py::test_get PASSED                                       [ 81%]
+tests/test_api.py::test_post FAILED                                      [ 90%]
+tests/test_api.py::test_delete PASSED                                    [100%]
+
+=================================== FAILURES ===================================
+_________________________________ test_login __________________________________
+
+    def test_login():
+        response = client.post("/login", json={"user": "a", "pass": "b"})
+>       assert response.status_code == 200
+E       AssertionError: Expected 200
+E       assert 401 == 200
+
+tests/test_auth.py:8: AssertionError
+_________________________________ test_query __________________________________
+
+    def test_query():
+        result = db.query("SELECT 1")
+>       assert len(result) > 0
+E       TypeError: object of type 'NoneType' has no len()
+
+tests/test_db.py:42: TypeError
+_________________________________ test_post ___________________________________
+
+    def test_post():
+        response = client.post("/api/items", json={"name": "x"})
+>       assert response.status_code == 201
+E       ConnectionError: connection refused
+
+tests/test_api.py:15: ConnectionError
+=========================== short test summary info ============================
+FAILED tests/test_auth.py::test_login - AssertionError: Expected 200
+FAILED tests/test_db.py::test_query - TypeError: object of type 'NoneType' ha...
+FAILED tests/test_api.py::test_post - ConnectionError: connection refused
+========================= 3 failed, 8 passed in 0.34s ==========================

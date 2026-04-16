@@ -407,7 +407,8 @@ class PytestParser(Parser):
         r"(?:(?P<error>\d+)\s+error)?"
         r"[,\s]*"
         r"(?:(?P<warning>\d+)\s+warning)?"
-        r"(?:\s+in\s+(?P<duration>[\d.]+)s)?"
+        # `\s*in\s+` — use `*` on left so the preceding `[,\s]*` doesn't eat the space `in` needs
+        r"(?:\s*in\s+(?P<duration>[\d.]+)s)?"
     )
 
     SHORT_SUMMARY_RE = re.compile(
@@ -1130,8 +1131,13 @@ class GitWriteParser(Parser):
 class DockerPsParser(Parser):
     """Parse `docker ps` / `docker images` output.
 
-    Handles default tabular format. Extracts ID, IMAGE, STATUS, PORTS, NAME.
+    Splits columns on 2+ spaces. Tolerant to variable column widths — does not
+    depend on header alignment matching data alignment (which breaks when values
+    are wider than the header column).
     """
+
+    # Header column names split the same way: by 2+ whitespace
+    MULTI_SPACE_RE = re.compile(r"\s{2,}")
 
     def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
         result = Result(tool="docker_ps", exit_code=0, duration=0)
@@ -1142,16 +1148,22 @@ class DockerPsParser(Parser):
             return result
 
         header = lines[0]
-        # Detect column positions by finding start of each known header
-        cols = self._column_positions(header)
-        kind = "images" if "REPOSITORY" in header else "ps"
+        col_names = self._split_cols(header)
+        kind = "images" if any(n == "REPOSITORY" for n in col_names) else "ps"
 
         rows: list[dict[str, str]] = []
         for line in lines[1:]:
-            row = self._split_by_positions(line, cols)
-            rows.append(row)
+            values = self._split_cols(line)
+            # Pad or truncate to match header arity
+            if len(values) < len(col_names):
+                values = values + [""] * (len(col_names) - len(values))
+            elif len(values) > len(col_names):
+                # Collapse trailing excess into last column (rare edge)
+                values = values[: len(col_names) - 1] + [
+                    "  ".join(values[len(col_names) - 1 :])
+                ]
+            rows.append(dict(zip(col_names, values)))
 
-        # Count running vs exited for `ps -a`
         running = 0
         stopped = 0
         for row in rows:
@@ -1168,33 +1180,9 @@ class DockerPsParser(Parser):
         result.extra["docker_stopped"] = stopped
         return result
 
-    @staticmethod
-    def _column_positions(header: str) -> list[tuple[str, int]]:
-        """Return list of (column_name, start_position)."""
-        positions: list[tuple[str, int]] = []
-        i = 0
-        while i < len(header):
-            if header[i] == " ":
-                i += 1
-                continue
-            start = i
-            # Advance to end of column name (2+ spaces = separator)
-            while i < len(header):
-                if header[i] == " " and (i + 1 < len(header) and header[i + 1] == " "):
-                    break
-                i += 1
-            name = header[start:i].strip()
-            if name:
-                positions.append((name, start))
-        return positions
-
-    @staticmethod
-    def _split_by_positions(line: str, cols: list[tuple[str, int]]) -> dict[str, str]:
-        row: dict[str, str] = {}
-        for idx, (name, start) in enumerate(cols):
-            end = cols[idx + 1][1] if idx + 1 < len(cols) else len(line)
-            row[name] = line[start:end].strip()
-        return row
+    @classmethod
+    def _split_cols(cls, line: str) -> list[str]:
+        return [c for c in cls.MULTI_SPACE_RE.split(line.strip()) if c]
 
 
 class GrepRgParser(Parser):
@@ -1722,17 +1710,25 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
             summary_parts.append(f"{result.errors} errors")
 
     summary_str = ", ".join(summary_parts) if summary_parts else ""
-    # Show 2 decimals for sub-second, 1 decimal otherwise
     if result.duration > 0:
-        duration_str = f"{result.duration:.2f}s" if result.duration < 1 else f"{result.duration:.1f}s"
+        duration_str = f"{result.duration:.2f}s"
     else:
         duration_str = ""
 
     meta = " | ".join(filter(None, [f"exit:{result.exit_code}", result.tool, summary_str, duration_str]))
     parts.append(meta)
 
-    # ── If passing or quiet, stop here (1 line) ──
-    if result.exit_code == 0 and (config.quiet or (not result.failures and not result.lint_issues)):
+    # ── Quiet mode: 1-line summary regardless of outcome ──
+    if config.quiet:
+        return "\n".join(parts)
+    # ── Passing with nothing to report: 1 line ──
+    has_generic_errors = result.tool == "generic" and result.extra.get("error_lines")
+    if (
+        result.exit_code == 0
+        and not result.failures
+        and not result.lint_issues
+        and not has_generic_errors
+    ):
         return "\n".join(parts)
 
     # ── Test failures: compact 1-line per failure ──
@@ -1782,14 +1778,16 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
             parts.append(f"+{remaining_groups} more rules")
 
     # ── Generic fallback: error extraction or head+tail ──
-    if result.tool == "generic" and result.exit_code != 0:
+    # Always render extracted errors (exit_code may be 0 in stdin mode even when errors exist)
+    if result.tool == "generic" and (result.exit_code != 0 or result.extra.get("error_lines")):
         error_lines = result.extra.get("error_lines", [])
         total = result.extra.get("total_lines", 0)
 
         if error_lines:
-            # Smart mode: show extracted error lines with context
             clean = remove_empty_and_decorative(error_lines)[:config.max_lines * 2]
             for line in clean:
+                if len(line) > 500:
+                    line = line[:497] + "..."
                 parts.append(line)
             if total > len(clean):
                 parts.append(f"... ({total - len(clean)} lines hidden, {total} total)")
