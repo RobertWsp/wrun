@@ -400,16 +400,20 @@ The harness exercises and validates:
 
 ## Optimization techniques
 
-1. **ANSI stripping** — CSI, OSC 8 hyperlinks, private mode sequences
+1. **ANSI stripping** — CSI, OSC 8 hyperlinks, OSC sequences (BEL/ST terminators), private mode
 2. **Path normalization** — relative to git root, worktree-aware, resolves `../../` traversals back to absolute when outside the project
-3. **Tool-specific parsers** — 18 parsers in the registry (5 test/lint + 7 new + 6 aliases)
+3. **Tool-specific parsers** — 17 parser classes, 22 registry entries counting aliases (mypy/ty → TscParser, ag → GrepRgParser, etc.)
 4. **Failures only** — passing tests are counted, not listed
 5. **Stack trace pruning** — `site-packages`, `node_modules`, `_pytest`, `pluggy`, `asyncio`, `threading` frames hidden
 6. **Rule grouping** — lint errors grouped by code with compact `[file:line, file:line, +N]` locations
-7. **Recursive noise filtering** — `tree` and `ls` skip entire `node_modules/.git/__pycache__/…` subtrees
-8. **IPv4+IPv6 port dedup** — `0.0.0.0:8080->80/tcp, [::]:8080->80/tcp` → `:8080`
-9. **Compact summary everywhere** — `exit:N | tool | count/status | duration`
-10. **Full output saved** — `~/.local/share/wrun/*.log`, auto-cleanup keeps last 20
+7. **Severity split** — biome shows `N errors, M warnings` separately; per-rule `[warn]` / `[info]` tags
+8. **Recursive noise filtering** — `tree` and `ls` skip entire `node_modules/.git/__pycache__/…` subtrees
+9. **IPv4+IPv6 port dedup** — `0.0.0.0:8080->80/tcp, [::]:8080->80/tcp` → `:8080`
+10. **Multi-reporter detection** — biome's 4 reporters (pretty/summary/github/json) handled with schema differences between Biome 1.x and 2.x (icons `⚠`/`!`, JSON `{secs,nanos}`/nanoseconds int, location shape)
+11. **TTY-aware wrapping** — `ls`/`tree`/`grep`/`rg`/`git`/`docker` skip optimization when stdout is piped (preserves `ls *.log | head | xargs cat` contract); override with `WRUN_FORCE_PIPE=1`
+12. **SIGPIPE handling** — `SIG_DFL` + `BrokenPipeError` trap so `wrun cmd | head` exits cleanly without tracebacks
+13. **Compact summary everywhere** — `exit:N | tool | count/status | duration`
+14. **Full output saved** — `~/.local/share/wrun/*.log`, auto-cleanup keeps last 20
 
 ## How it works
 
@@ -418,7 +422,7 @@ AI agent: uv run pytest tests/
     ↓
 ~/.zshenv detects non-interactive shell → sets WRUN_AUTO=1 + sources integration.zsh
     ↓
-uv() shell function sees `uv run pytest` → prepends `wrun`
+uv() shell function sees `uv run pytest` → checks _wrun_active / _wrun_pipe_active → prepends `wrun`
     ↓
 wrun spawns subprocess (calls binary directly — shell functions bypassed, no recursion)
     ↓
@@ -426,7 +430,7 @@ captures stdout+stderr → strips ANSI → relativizes paths to git root
     ↓
 detects tool: cmd-parts match → SINGLE_CMD_MAP / GIT_SUBCOMMANDS / DOCKER_SUBCOMMANDS / TOOL_MAP
     ↓
-parser extracts: counts, failures with file:line, assertions, diagnostics
+parser extracts: counts, failures with file:line, assertions, diagnostics, severity
     ↓
 formatter emits: `exit:N | tool | summary` + compact details + `full: path`
     ↓
@@ -434,6 +438,8 @@ agent receives minimal, parseable output; can jump directly to file:line locatio
 ```
 
 No infinite recursion is possible: `subprocess.run([cmd, ...])` invokes the binary directly, not via the shell, so wrapper shell functions are not triggered from inside wrun.
+
+For shell pipelines like `ls *.log | head -1 | xargs cat`, the `_wrun_pipe_active` helper detects that stdout is not a TTY and skips wrapping, so downstream consumers see raw file paths instead of the optimized `exit:0 | ls | N entries` header. Diagnostic tools (pytest, ruff, biome, tsc, …) keep unconditional wrapping — their structured output benefits agents that capture via subprocess.
 
 ## Requirements
 
