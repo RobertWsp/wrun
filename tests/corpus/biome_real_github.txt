@@ -1,0 +1,20 @@
+::warning title=lint/correctness/noUnusedImports,file=src/api.ts,line=1,endLine=1,col=8,endColumn=20::This import is unused.
+::warning title=lint/style/useConst,file=src/app.ts,line=6,endLine=6,col=1,endColumn=4::This let declares a variable that is only assigned once.
+::warning title=lint/correctness/noUnusedVariables,file=src/app.ts,line=6,endLine=6,col=5,endColumn=11::This variable unused is unused.
+::warning title=lint/correctness/noUnusedVariables,file=src/app.ts,line=7,endLine=7,col=7,endColumn=13::This variable result is unused.
+::warning title=lint/correctness/noUnusedVariables,file=src/bad-format.ts,line=1,endLine=1,col=11,endColumn=14::This function foo is unused.
+::warning title=lint/correctness/noUnusedVariables,file=src/broken.ts,line=1,endLine=1,col=10,endColumn=13::This function foo is unused.
+::error title=format,file=src/api.ts,line=1,endLine=1,col=2,endColumn=2::Formatter would have printed the following content:
+::error title=lint/suspicious/noExplicitAny,file=src/app.ts,line=1,endLine=1,col=17,endColumn=20::Unexpected any. Specify a different type.
+::error title=lint/suspicious/noDebugger,file=src/app.ts,line=2,endLine=2,col=3,endColumn=12::This is an unexpected use of the debugger statement.
+::error title=format,file=src/app.ts,line=1,endLine=1,col=2,endColumn=2::Formatter would have printed the following content:
+::error title=format,file=src/bad-format.ts,line=1,endLine=1,col=2,endColumn=2::Formatter would have printed the following content:
+::error title=format,file=src/broken.ts,line=1,endLine=1,col=2,endColumn=2::Formatter would have printed the following content:
+::error title=format,file=src/clean.ts,line=1,endLine=1,col=2,endColumn=2::Formatter would have printed the following content:
+::error title=assist/source/organizeImports,file=src/utils.ts,line=6,endLine=6,col=1,endColumn=22::The imports and exports are not sorted.
+::error title=format,file=src/utils.ts,line=1,endLine=1,col=2,endColumn=2::Formatter would have printed the following content:
+check ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Some errors were emitted while running checks.
+  
+

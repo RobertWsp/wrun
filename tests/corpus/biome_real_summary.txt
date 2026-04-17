@@ -1,0 +1,42 @@
+reporter/format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  i The following files need to be formatted:
+  
+  - src/api.ts
+  - src/app.ts
+  - src/bad-format.ts
+  - src/broken.ts
+  - src/clean.ts
+  - src/utils.ts
+  
+reporter/violations ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  i Some lint rules or assist actions reported some violations.
+  
+  i The following files have violations:
+  
+  - src/api.ts (1 warning)
+  - src/app.ts (2 errors, 3 warnings)
+  - src/bad-format.ts (1 warning)
+  - src/broken.ts (1 warning)
+  - src/utils.ts (1 error)
+  
+  i The following lint rules have violations:
+  
+  Rule Name                                        Diagnostics
+  
+  lint/correctness/noUnusedVariables               4 (4 warnings)
+  lint/correctness/noUnusedImports                 1 (1 warning)
+  lint/suspicious/noExplicitAny                    1 (1 error)
+  assist/source/organizeImports                    1 (1 error)
+  lint/suspicious/noDebugger                       1 (1 error)
+  lint/style/useConst                              1 (1 warning)
+
+Checked 6 files in 2ms. No fixes applied.
+Found 9 errors.
+Found 6 warnings.
+check ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Some errors were emitted while running checks.
+  
+

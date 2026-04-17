@@ -1,0 +1,124 @@
+src/app.ts:6:1 lint/style/useConst  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! This let declares a variable that is only assigned once.
+  
+    4 │ }
+    5 │ 
+  > 6 │ let unused = 42;
+      │ ^^^
+    7 │ const result = foo(1);
+    8 │ 
+  
+  i 'unused' is never reassigned.
+  
+    4 │ }
+    5 │ 
+  > 6 │ let unused = 42;
+      │     ^^^^^^
+    7 │ const result = foo(1);
+    8 │ 
+  
+  i Safe fix: Use const instead.
+  
+    4 4 │   }
+    5 5 │   
+    6   │ - let·unused·=·42;
+      6 │ + const·unused·=·42;
+    7 7 │   const result = foo(1);
+    8 8 │   
+  
+
+src/app.ts:6:5 lint/correctness/noUnusedVariables  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! This variable unused is unused.
+  
+    4 │ }
+    5 │ 
+  > 6 │ let unused = 42;
+      │     ^^^^^^
+    7 │ const result = foo(1);
+    8 │ 
+  
+  i Unused variables are often the result of typos, incomplete refactors, or other sources of bugs.
+  
+  i Unsafe fix: If this is intentional, prepend unused with an underscore.
+  
+    4 4 │   }
+    5 5 │   
+    6   │ - let·unused·=·42;
+      6 │ + let·_unused·=·42;
+    7 7 │   const result = foo(1);
+    8 8 │   
+  
+
+src/app.ts:7:7 lint/correctness/noUnusedVariables  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! This variable result is unused.
+  
+    6 │ let unused = 42;
+  > 7 │ const result = foo(1);
+      │       ^^^^^^
+    8 │ 
+  
+  i Unused variables are often the result of typos, incomplete refactors, or other sources of bugs.
+  
+  i Unsafe fix: If this is intentional, prepend result with an underscore.
+  
+    5 5 │   
+    6 6 │   let unused = 42;
+    7   │ - const·result·=·foo(1);
+      7 │ + const·_result·=·foo(1);
+    8 8 │   
+  
+
+src/app.ts:1:17 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Unexpected any. Specify a different type.
+  
+  > 1 │ function foo(x: any) {
+      │                 ^^^
+    2 │   debugger;
+    3 │   return x;
+  
+  i any disables many type checking rules. Its use should be avoided.
+  
+
+src/app.ts:2:3 lint/suspicious/noDebugger  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × This is an unexpected use of the debugger statement.
+  
+    1 │ function foo(x: any) {
+  > 2 │   debugger;
+      │   ^^^^^^^^^
+    3 │   return x;
+    4 │ }
+  
+  i Unsafe fix: Remove debugger statement
+  
+    1 1 │   function foo(x: any) {
+    2   │ - ··debugger;
+    3 2 │     return x;
+    4 3 │   }
+  
+
+src/app.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+    1 1 │   function foo(x: any) {
+    2   │ - ··debugger;
+    3   │ - ··return·x;
+      2 │ + → debugger;
+      3 │ + → return·x;
+    4 4 │   }
+    5 5 │   
+  
+
+Checked 1 file in 3ms. No fixes applied.
+Found 3 errors.
+Found 3 warnings.
+check ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Some errors were emitted while running checks.
+  
+

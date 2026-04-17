@@ -280,7 +280,7 @@ Clean run (no diagnostics):
 exit:0 | biome | clean | 12 files | 8ms
 ```
 
-## Measured reduction — 73-case harness
+## Measured reduction — 81-case harness
 
 `tests/harness.py` runs every parser against synthetic + real commands and asserts structural expectations (field presence, counts, line numbers, flags). Run it with:
 
@@ -291,8 +291,10 @@ python3 tests/harness.py
 Current result:
 
 ```
-Total: 73 | PASS: 75 | FAIL: 0
+Total: 81 | PASS: 83 | FAIL: 0
 ```
+
+The harness includes **8 cases using actual Biome 2.4.12 output** (`tests/corpus/biome_real_*.txt`) captured from `npm install @biomejs/biome@latest` runs against TypeScript fixtures covering: clean files, explicit any, unused vars, debugger, unused imports, format violations, assist/organizeImports, and all 4 reporters (pretty, summary, github, json).
 
 Selected cases (bytes in → bytes out):
 

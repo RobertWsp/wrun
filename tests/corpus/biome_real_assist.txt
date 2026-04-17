@@ -1,0 +1,40 @@
+src/utils.ts:6:1 assist/source/organizeImports  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × The imports and exports are not sorted.
+  
+    4 │   return counter;
+    5 │ }
+  > 6 │ export { increment };
+      │ ^^^^^^^^^^^^^^^^^^^^^
+    7 │ 
+  
+  i Safe fix: Organize Imports (Biome)
+  
+    4 4 │     return counter;
+    5 5 │   }
+      6 │ + 
+    6 7 │   export { increment };
+    7 8 │   
+  
+
+src/utils.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+    1 1 │   let counter = 0;
+    2 2 │   function increment() {
+    3   │ - ··counter·=·counter·+·1;
+    4   │ - ··return·counter;
+      3 │ + → counter·=·counter·+·1;
+      4 │ + → return·counter;
+    5 5 │   }
+    6 6 │   export { increment };
+  
+
+Checked 1 file in 2ms. No fixes applied.
+Found 2 errors.
+check ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Some errors were emitted while running checks.
+  
+

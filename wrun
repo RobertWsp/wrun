@@ -816,14 +816,17 @@ class BiomeParser(Parser):
     FORMAT_HEADER_RE = re.compile(
         r"^(?P<file>[^\s:]+(?::[^\s:/]+)*?)\s+format\s+━"
     )
-    GITHUB_RE = re.compile(
-        r"^::(?P<level>error|warning|notice)\s+file=(?P<file>[^,]+),"
-        r"line=(?P<line>\d+),col=(?P<col>\d+)"
-        r"(?:,[^:]*?title=(?P<code>[^,:]+))?"
-        r"[^:]*::\s*(?P<msg>.+)$"
+    # GitHub Actions reporter: keys come in any order (Biome 2.x puts `title=` first,
+    # Biome 1.x puts `file=` first). Parse key=value pairs independently.
+    GITHUB_LINE_RE = re.compile(
+        r"^::(?P<level>error|warning|notice)\s+(?P<kv>[^:]*?)::\s*(?P<msg>.+)$"
     )
-    ERROR_MSG_RE = re.compile(r"^\s*[×✖]\s+(?P<msg>.+?)\s*$")
-    WARN_MSG_RE = re.compile(r"^\s*⚠\s+(?P<msg>.+?)\s*$")
+    GITHUB_KV_RE = re.compile(r"(?P<k>\w+)=(?P<v>[^,]+)")
+    # Icons: Biome 1.x uses Unicode (× ⚠ ℹ), Biome 2.x uses ASCII (× ! i).
+    # Require 1-4 leading spaces + icon + space + non-whitespace to avoid false positives.
+    ERROR_MSG_RE = re.compile(r"^ {1,4}[×✖]\s+(?P<msg>\S.+?)\s*$")
+    WARN_MSG_RE = re.compile(r"^ {1,4}[⚠!]\s+(?P<msg>\S.+?)\s*$")
+    INFO_MSG_RE = re.compile(r"^ {1,4}[ℹi]\s+(?P<msg>\S.+?)\s*$")
     BOX_FILLER_RE = re.compile(r"\s*(?:FIXABLE\s+)?[━─═_\-]{3,}.*$")
     ERRORS_SUMMARY_RE = re.compile(r"Found\s+(?P<errors>\d+)\s+error")
     WARNINGS_SUMMARY_RE = re.compile(r"Found\s+(?P<warnings>\d+)\s+warning")
@@ -835,7 +838,9 @@ class BiomeParser(Parser):
     FIXABLE_RE = re.compile(
         r"(?P<n>\d+)\s+fix(?:es)?\s+applicable\s+with\s+(?:the\s+)?--write"
     )
-    FIX_HINT_RE = re.compile(r"^\s*ℹ\s+(?:Safe|Unsafe)\s+fix:", re.IGNORECASE)
+    FIX_HINT_RE = re.compile(r"^\s{1,4}(?:ℹ|i)\s+(?:Safe|Unsafe)\s+fix:", re.IGNORECASE)
+    # Phantom diagnostic codes emitted as footers — skip, they're not real issues
+    PHANTOM_CODES = frozenset({"check", "format", "reporter/format", "reporter/violations", "reporter/summary"})
     # Summary-section markers: body scan must stop here so the main loop sees them
     SUMMARY_MARKER_RE = re.compile(
         r"^(?:Checked\s+\d|Found\s+\d|Skipped\s+\d|Fixed\s+\d|"
@@ -845,12 +850,31 @@ class BiomeParser(Parser):
     )
 
     def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
-        head = output.lstrip()
-        if head.startswith("{") and '"diagnostics"' in head[:400]:
-            parsed = self._parse_json(head, git_root)
+        # Biome 2.x emits preamble + single-line JSON + footer. Find the JSON blob.
+        json_blob = self._find_json_blob(output)
+        if json_blob is not None:
+            parsed = self._parse_json(json_blob, git_root)
             if parsed is not None:
                 return parsed
         return self._parse_text(output, git_root)
+
+    @staticmethod
+    def _find_json_blob(output: str) -> Optional[str]:
+        """Extract a single-line JSON blob with a "diagnostics" key.
+
+        Biome 2.x wraps the JSON output between an experimental-warning preamble
+        and a `check ━━━` footer. Scanning by whole lines is the fastest way to
+        isolate the blob without a brace-balancing pass.
+        """
+        for line in output.splitlines():
+            stripped = line.strip()
+            if (
+                stripped.startswith("{")
+                and stripped.endswith("}")
+                and '"diagnostics"' in stripped
+            ):
+                return stripped
+        return None
 
     def _parse_json(self, output: str, git_root: Optional[Path]) -> Optional[Result]:
         try:
@@ -862,10 +886,15 @@ class BiomeParser(Parser):
         summary = data.get("summary") or {}
         diagnostics = data.get("diagnostics") or []
 
-        dur = summary.get("duration") or {}
-        secs = float(dur.get("secs") or 0)
-        nanos = float(dur.get("nanos") or 0)
-        result.duration = round(secs + nanos / 1e9, 3)
+        # Biome 1.x: duration = {secs: N, nanos: N}
+        # Biome 2.x: duration = integer nanoseconds (observed: 1990067 ns ≈ 2ms)
+        dur = summary.get("duration")
+        if isinstance(dur, dict):
+            secs = float(dur.get("secs") or 0)
+            nanos = float(dur.get("nanos") or 0)
+            result.duration = round(secs + nanos / 1e9, 6)
+        elif isinstance(dur, (int, float)):
+            result.duration = round(float(dur) / 1_000_000_000, 9)
 
         result.errors = int(summary.get("errors") or 0)
         result.extra["biome_warnings"] = int(summary.get("warnings") or 0)
@@ -879,9 +908,24 @@ class BiomeParser(Parser):
         issues: list[LintIssue] = []
         for d in diagnostics:
             loc = d.get("location") or {}
-            path = (loc.get("path") or {}).get("file", "")
+            # Biome 2.x: location.path is a plain string.
+            # Biome 1.x: location.path is {"file": "..."}.
+            path_raw = loc.get("path")
+            if isinstance(path_raw, dict):
+                path = path_raw.get("file", "")
+            elif isinstance(path_raw, str):
+                path = path_raw
+            else:
+                path = ""
             if git_root and path:
                 path = relativize_path(path, git_root)
+
+            # Biome 2.x: location.start = {line, column}
+            # Biome 1.x: location.span = [start_offset, end_offset] (no line/col)
+            start = loc.get("start") or {}
+            line_n = int(start.get("line") or 0) if isinstance(start, dict) else 0
+            col_n = int(start.get("column") or 0) if isinstance(start, dict) else 0
+
             description = (d.get("description") or "").strip()
             if not description:
                 message = d.get("message")
@@ -896,8 +940,8 @@ class BiomeParser(Parser):
             issues.append(
                 LintIssue(
                     file=path,
-                    line=0,
-                    col=0,
+                    line=line_n,
+                    col=col_n,
                     code=str(d.get("category") or "").strip(),
                     message=description,
                     severity=str(d.get("severity") or "error").lower(),
@@ -906,7 +950,8 @@ class BiomeParser(Parser):
 
         result.lint_issues = issues
         result.total = len(issues)
-        result.failed = result.errors or len(issues)
+        warnings_count = result.extra.get("biome_warnings", 0)
+        result.failed = result.errors or warnings_count or len(issues)
         result.extra["biome_reporter"] = "json"
         return result
 
@@ -922,19 +967,31 @@ class BiomeParser(Parser):
             raw = lines[i]
             stripped = raw.strip()
 
-            gm = self.GITHUB_RE.match(stripped)
+            gm = self.GITHUB_LINE_RE.match(stripped)
             if gm:
-                file_path = gm.group("file")
-                if git_root:
+                kv = dict(
+                    (m.group("k"), m.group("v").strip())
+                    for m in self.GITHUB_KV_RE.finditer(gm.group("kv"))
+                )
+                file_path = kv.get("file", "")
+                if git_root and file_path:
                     file_path = relativize_path(file_path, git_root)
                 level = (gm.group("level") or "error").lower()
                 severity = "warning" if level in ("warning", "notice") else "error"
+                try:
+                    line_n = int(kv.get("line", "0"))
+                except ValueError:
+                    line_n = 0
+                try:
+                    col_n = int(kv.get("col", "0"))
+                except ValueError:
+                    col_n = 0
                 issues.append(
                     LintIssue(
                         file=file_path,
-                        line=int(gm.group("line")),
-                        col=int(gm.group("col")),
-                        code=gm.group("code") or "",
+                        line=line_n,
+                        col=col_n,
+                        code=kv.get("title", ""),
                         message=gm.group("msg").strip(),
                         severity=severity,
                     )
@@ -946,6 +1003,10 @@ class BiomeParser(Parser):
             fm = self.FORMAT_HEADER_RE.match(stripped)
             if fm:
                 file_path = fm.group("file")
+                # Skip phantom "format ━━━" footer (empty file path or "format" itself)
+                if file_path in ("format", "check", ""):
+                    i += 1
+                    continue
                 if git_root:
                     file_path = relativize_path(file_path, git_root)
                 msg, sev, consumed = self._scan_body(lines, i + 1)
@@ -962,12 +1023,22 @@ class BiomeParser(Parser):
                 i = consumed
                 continue
 
+            # Summary-reporter section headers: mark reporter kind + skip.
+            if stripped.startswith(("reporter/format", "reporter/violations", "reporter/summary")):
+                reporter = "summary"
+                i += 1
+                continue
+
             m = self.DIAG_RE.match(stripped)
             if m:
                 file_path = m.group("file")
+                code = m.group("code")
+                # Skip phantom footers like `check ━━━` that happen to match `file:...`
+                if code in self.PHANTOM_CODES or file_path in self.PHANTOM_CODES:
+                    i += 1
+                    continue
                 if git_root:
                     file_path = relativize_path(file_path, git_root)
-                code = m.group("code")
                 tail = (m.group("tail") or "").strip()
                 tail_clean = self.BOX_FILLER_RE.sub("", tail).strip()
 
@@ -2286,8 +2357,10 @@ def _format_biome(result: Result, config: Config) -> str:
     if checked:
         meta_extras.append(f"{checked} file" + ("s" if checked != 1 else ""))
     if result.duration > 0:
-        if result.duration < 1:
-            meta_extras.append(f"{int(result.duration * 1000)}ms")
+        if result.duration < 0.001:
+            meta_extras.append(f"{int(result.duration * 1_000_000)}µs")
+        elif result.duration < 1:
+            meta_extras.append(f"{max(1, round(result.duration * 1000))}ms")
         else:
             meta_extras.append(f"{result.duration:.2f}s")
     if reporter and reporter not in ("pretty", ""):
