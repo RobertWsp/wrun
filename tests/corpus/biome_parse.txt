@@ -1,0 +1,13 @@
+./src/broken.ts:5:13 parse ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Expected a semicolon or an implicit semicolon after a statement, but found none.
+
+    3 │ function foo() {
+    4 │   const x = 1
+    5 │   return x
+      │          ^
+    6 │ }
+
+
+Checked 1 file in 2ms. No fixes applied.
+Found 1 error.

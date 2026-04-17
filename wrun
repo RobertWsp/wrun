@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -59,6 +60,15 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+# Restore default SIGPIPE so `wrun cmd | head`, `wrun cmd | less -q`, etc. exit
+# quietly on pipe close instead of raising BrokenPipeError tracebacks.
+# Python installs SIG_IGN by default for SIGPIPE in interpreters.
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except (AttributeError, ValueError):
+    # AttributeError on Windows (no SIGPIPE); ValueError off the main thread.
+    pass
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -123,6 +133,7 @@ class LintIssue:
     col: int = 0
     code: str = ""
     message: str = ""
+    severity: str = "error"
 
 
 @dataclass
@@ -186,7 +197,11 @@ def relativize_path(path_str: str, root: Path) -> str:
         pass
     # For already-relative paths, check for excessive traversal
     if path_str.startswith("../../"):
-        return str(Path(path_str).resolve())
+        try:
+            return str(Path(path_str).resolve(strict=False))
+        except (OSError, RuntimeError):
+            # RuntimeError can surface on symlink cycles, OSError on unreadable FS
+            return path_str
     return path_str
 
 
@@ -747,7 +762,7 @@ class RuffParser(Parser):
                 file_path = ""
                 line_num = 0
                 col_num = 0
-                for j in range(i + 1, min(i + 4, len(lines))):
+                for j in range(i + 1, min(i + 6, len(lines))):
                     lm = self.MODERN_LOC_RE.match(lines[j])
                     if lm:
                         file_path = lm.group("file")
@@ -778,50 +793,291 @@ class RuffParser(Parser):
 
 
 class BiomeParser(Parser):
-    """Parser for biome check/lint output."""
+    """Parser for biome check/lint/format output.
 
+    Four reporter shapes, one parse path each:
+      pretty (default): `file:L:C category ━━━` + body `× / ⚠ msg`
+      summary:          `category ━━━` grouped rule listings
+      github:           `::error file=…,line=N,col=N,title=CODE::msg`
+      json:             single JSON blob (biome --reporter=json)
+
+    Severity is inferred from the body icon:
+      × / ✖ → error    ⚠ → warning    ℹ → info
+    """
+
+    # Pretty/summary headers with location. Code can be `lint/...`, `assist/...`,
+    # `parse`, or a plain rule name — a trailing `/…` path is optional.
     DIAG_RE = re.compile(
-        r"(?P<file>\S+):(?P<line>\d+):(?P<col>\d+)\s+"
-        r"(?P<level>error|warning|info)\s+"
-        r"(?P<code>\S+)\s+"
-        r"(?P<msg>.+)"
+        r"^(?P<file>[^\s:]+(?::[^\s:/]+)*?):(?P<line>\d+):(?P<col>\d+)\s+"
+        r"(?P<code>[a-zA-Z][a-zA-Z0-9_]*(?:/\S+)?)"
+        r"(?:\s+(?P<tail>.*))?$"
     )
-    SIMPLE_RE = re.compile(r"^(?P<file>\S+)\s+(?P<code>[a-zA-Z]+/\S+)\s+.*$")
-    SUMMARY_RE = re.compile(r"(?:Found\s+)?(?P<errors>\d+)\s+error|(?P<warns>\d+)\s+warning")
+    # Format diagnostic header (no line/col): `file format ━━━`
+    FORMAT_HEADER_RE = re.compile(
+        r"^(?P<file>[^\s:]+(?::[^\s:/]+)*?)\s+format\s+━"
+    )
+    GITHUB_RE = re.compile(
+        r"^::(?P<level>error|warning|notice)\s+file=(?P<file>[^,]+),"
+        r"line=(?P<line>\d+),col=(?P<col>\d+)"
+        r"(?:,[^:]*?title=(?P<code>[^,:]+))?"
+        r"[^:]*::\s*(?P<msg>.+)$"
+    )
+    ERROR_MSG_RE = re.compile(r"^\s*[×✖]\s+(?P<msg>.+?)\s*$")
+    WARN_MSG_RE = re.compile(r"^\s*⚠\s+(?P<msg>.+?)\s*$")
+    BOX_FILLER_RE = re.compile(r"\s*(?:FIXABLE\s+)?[━─═_\-]{3,}.*$")
+    ERRORS_SUMMARY_RE = re.compile(r"Found\s+(?P<errors>\d+)\s+error")
+    WARNINGS_SUMMARY_RE = re.compile(r"Found\s+(?P<warnings>\d+)\s+warning")
+    CHECKED_RE = re.compile(
+        r"Checked\s+(?P<files>\d+)\s+files?\s+in\s+(?P<val>\d+(?:\.\d+)?)\s*(?P<unit>ms|s|µs)"
+    )
+    FIXED_RE = re.compile(r"Fixed\s+(?P<files>\d+)\s+files?")
+    SKIPPED_RE = re.compile(r"Skipped\s+(?P<files>\d+)\s+files?")
+    FIXABLE_RE = re.compile(
+        r"(?P<n>\d+)\s+fix(?:es)?\s+applicable\s+with\s+(?:the\s+)?--write"
+    )
+    FIX_HINT_RE = re.compile(r"^\s*ℹ\s+(?:Safe|Unsafe)\s+fix:", re.IGNORECASE)
+    # Summary-section markers: body scan must stop here so the main loop sees them
+    SUMMARY_MARKER_RE = re.compile(
+        r"^(?:Checked\s+\d|Found\s+\d|Skipped\s+\d|Fixed\s+\d|"
+        r"\d+\s+fix(?:es)?\s+applicable|Some\s+of\s+the\s+lint|"
+        r"The\s+number\s+of\s+diagnostics)",
+        re.IGNORECASE,
+    )
 
     def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
-        lines = output.splitlines()
+        head = output.lstrip()
+        if head.startswith("{") and '"diagnostics"' in head[:400]:
+            parsed = self._parse_json(head, git_root)
+            if parsed is not None:
+                return parsed
+        return self._parse_text(output, git_root)
+
+    def _parse_json(self, output: str, git_root: Optional[Path]) -> Optional[Result]:
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError:
+            return None
+
         result = Result(tool="biome", exit_code=0, duration=0)
+        summary = data.get("summary") or {}
+        diagnostics = data.get("diagnostics") or []
+
+        dur = summary.get("duration") or {}
+        secs = float(dur.get("secs") or 0)
+        nanos = float(dur.get("nanos") or 0)
+        result.duration = round(secs + nanos / 1e9, 3)
+
+        result.errors = int(summary.get("errors") or 0)
+        result.extra["biome_warnings"] = int(summary.get("warnings") or 0)
+        result.extra["biome_checked"] = int(summary.get("unchanged") or 0) + int(
+            summary.get("changed") or 0
+        )
+        result.extra["biome_fixed"] = int(summary.get("changed") or 0)
+        result.extra["biome_skipped"] = int(summary.get("skipped") or 0)
+        result.extra["biome_fixable"] = int(summary.get("suggestedFixesSkipped") or 0)
+
         issues: list[LintIssue] = []
-
-        for line in lines:
-            line_stripped = line.strip()
-            m = self.DIAG_RE.match(line_stripped)
-            if not m:
-                m = self.SIMPLE_RE.match(line_stripped)
-            if m:
-                file_path = m.group("file")
-                if git_root:
-                    file_path = relativize_path(file_path, git_root)
-                issues.append(
-                    LintIssue(
-                        file=file_path,
-                        line=int(m.group("line")) if "line" in m.groupdict() and m.group("line") else 0,
-                        col=int(m.group("col")) if "col" in m.groupdict() and m.group("col") else 0,
-                        code=m.group("code"),
-                        message=m.group("msg").strip() if "msg" in m.groupdict() and m.group("msg") else "",
-                    )
+        for d in diagnostics:
+            loc = d.get("location") or {}
+            path = (loc.get("path") or {}).get("file", "")
+            if git_root and path:
+                path = relativize_path(path, git_root)
+            description = (d.get("description") or "").strip()
+            if not description:
+                message = d.get("message")
+                if isinstance(message, str):
+                    description = message.strip()
+                elif isinstance(message, list) and message:
+                    parts = [
+                        m.get("content", "") if isinstance(m, dict) else str(m)
+                        for m in message
+                    ]
+                    description = "".join(parts).strip()
+            issues.append(
+                LintIssue(
+                    file=path,
+                    line=0,
+                    col=0,
+                    code=str(d.get("category") or "").strip(),
+                    message=description,
+                    severity=str(d.get("severity") or "error").lower(),
                 )
-
-            sm = self.SUMMARY_RE.search(line)
-            if sm:
-                if sm.group("errors"):
-                    result.errors = int(sm.group("errors"))
+            )
 
         result.lint_issues = issues
         result.total = len(issues)
         result.failed = result.errors or len(issues)
+        result.extra["biome_reporter"] = "json"
         return result
+
+    def _parse_text(self, output: str, git_root: Optional[Path]) -> Result:
+        lines = output.splitlines()
+        result = Result(tool="biome", exit_code=0, duration=0)
+        issues: list[LintIssue] = []
+        fixable_hints = 0
+        reporter = "pretty"
+
+        i = 0
+        while i < len(lines):
+            raw = lines[i]
+            stripped = raw.strip()
+
+            gm = self.GITHUB_RE.match(stripped)
+            if gm:
+                file_path = gm.group("file")
+                if git_root:
+                    file_path = relativize_path(file_path, git_root)
+                level = (gm.group("level") or "error").lower()
+                severity = "warning" if level in ("warning", "notice") else "error"
+                issues.append(
+                    LintIssue(
+                        file=file_path,
+                        line=int(gm.group("line")),
+                        col=int(gm.group("col")),
+                        code=gm.group("code") or "",
+                        message=gm.group("msg").strip(),
+                        severity=severity,
+                    )
+                )
+                reporter = "github"
+                i += 1
+                continue
+
+            fm = self.FORMAT_HEADER_RE.match(stripped)
+            if fm:
+                file_path = fm.group("file")
+                if git_root:
+                    file_path = relativize_path(file_path, git_root)
+                msg, sev, consumed = self._scan_body(lines, i + 1)
+                issues.append(
+                    LintIssue(
+                        file=file_path,
+                        line=0,
+                        col=0,
+                        code="format",
+                        message=msg or "File content differs from formatting output",
+                        severity=sev,
+                    )
+                )
+                i = consumed
+                continue
+
+            m = self.DIAG_RE.match(stripped)
+            if m:
+                file_path = m.group("file")
+                if git_root:
+                    file_path = relativize_path(file_path, git_root)
+                code = m.group("code")
+                tail = (m.group("tail") or "").strip()
+                tail_clean = self.BOX_FILLER_RE.sub("", tail).strip()
+
+                msg = ""
+                inline_sev = "error"
+                if tail_clean:
+                    if mw := self.WARN_MSG_RE.match(tail_clean):
+                        msg = mw.group("msg").strip()
+                        inline_sev = "warning"
+                    elif me := self.ERROR_MSG_RE.match(tail_clean):
+                        msg = me.group("msg").strip()
+                    else:
+                        msg = tail_clean
+
+                if msg:
+                    severity = inline_sev
+                    consumed = i + 1
+                else:
+                    msg, severity, consumed = self._scan_body(lines, i + 1)
+
+                issues.append(
+                    LintIssue(
+                        file=file_path,
+                        line=int(m.group("line")),
+                        col=int(m.group("col")),
+                        code=code,
+                        message=msg,
+                        severity=severity,
+                    )
+                )
+                i = consumed
+                continue
+
+            if self.FIX_HINT_RE.match(raw):
+                fixable_hints += 1
+
+            if sm := self.ERRORS_SUMMARY_RE.search(stripped):
+                result.errors = int(sm.group("errors"))
+            if wm := self.WARNINGS_SUMMARY_RE.search(stripped):
+                result.extra["biome_warnings"] = int(wm.group("warnings"))
+            if cm := self.CHECKED_RE.search(stripped):
+                result.extra["biome_checked"] = int(cm.group("files"))
+                val = float(cm.group("val"))
+                unit = cm.group("unit")
+                if unit == "ms":
+                    result.duration = round(val / 1000, 3)
+                elif unit == "µs":
+                    result.duration = round(val / 1_000_000, 6)
+                else:
+                    result.duration = round(val, 3)
+            if fm_fixed := self.FIXED_RE.search(stripped):
+                result.extra["biome_fixed"] = int(fm_fixed.group("files"))
+            if sk := self.SKIPPED_RE.search(stripped):
+                result.extra["biome_skipped"] = int(sk.group("files"))
+            if fa := self.FIXABLE_RE.search(stripped):
+                result.extra["biome_fixable"] = int(fa.group("n"))
+
+            i += 1
+
+        # Fallback: summary lines are optional (ex.: truncated logs). Infer from issues.
+        if result.errors == 0 and any(iss.severity == "error" for iss in issues):
+            result.errors = sum(1 for iss in issues if iss.severity == "error")
+        if "biome_warnings" not in result.extra and any(
+            iss.severity == "warning" for iss in issues
+        ):
+            result.extra["biome_warnings"] = sum(
+                1 for iss in issues if iss.severity == "warning"
+            )
+        if "biome_fixable" not in result.extra and fixable_hints:
+            result.extra["biome_fixable"] = fixable_hints
+
+        result.lint_issues = issues
+        result.total = len(issues)
+        warnings_count = result.extra.get("biome_warnings", 0)
+        result.failed = result.errors or warnings_count or len(issues)
+        result.extra["biome_reporter"] = reporter
+        return result
+
+    def _scan_body(self, lines: list[str], start: int) -> tuple[str, str, int]:
+        """Scan body after a header. Return (message, severity, next_index).
+
+        Stops at the next diagnostic header or at any summary-section marker
+        (Checked/Found/Skipped/Fixed/N fix applicable/…) — otherwise greedy
+        10-line lookahead would eat the run summary and drop duration + counts.
+        """
+        msg = ""
+        severity = "error"
+        end = start
+        for j in range(start, min(start + 10, len(lines))):
+            line = lines[j]
+            sline = line.strip()
+            if (
+                self.DIAG_RE.match(sline)
+                or self.FORMAT_HEADER_RE.match(sline)
+                or self.SUMMARY_MARKER_RE.match(sline)
+            ):
+                break
+            if not msg:
+                if mw := self.WARN_MSG_RE.match(line):
+                    msg = mw.group("msg").strip()
+                    severity = "warning"
+                    end = j + 1
+                    continue
+                if me := self.ERROR_MSG_RE.match(line):
+                    msg = me.group("msg").strip()
+                    severity = "error"
+                    end = j + 1
+                    continue
+            end = j + 1
+        return msg, severity, max(end, start + 1)
 
 
 class TscParser(Parser):
@@ -1246,7 +1502,7 @@ class DockerPsParser(Parser):
             status = row.get("STATUS", "")
             if status.startswith("Up"):
                 running += 1
-            elif status.startswith(("Exited", "Created", "Dead", "Restarting")):
+            elif status.startswith(("Exited", "Created", "Dead", "Restarting", "Paused", "Removing")):
                 stopped += 1
 
         result.total = len(rows)
@@ -2003,6 +2259,106 @@ def _format_kubectl(result: Result, config: Config) -> str:
     return "\n".join(parts)
 
 
+def _format_biome(result: Result, config: Config) -> str:
+    """Compact biome output: error/warning split + duration + fixable hint."""
+    errors = result.errors
+    warnings = result.extra.get("biome_warnings", 0)
+    checked = result.extra.get("biome_checked", 0)
+    fixed = result.extra.get("biome_fixed", 0)
+    skipped = result.extra.get("biome_skipped", 0)
+    fixable = result.extra.get("biome_fixable", 0)
+    reporter = result.extra.get("biome_reporter", "")
+
+    # Summary bits
+    status_bits: list[str] = []
+    if errors:
+        status_bits.append(f"{errors} error" + ("s" if errors != 1 else ""))
+    if warnings:
+        status_bits.append(f"{warnings} warning" + ("s" if warnings != 1 else ""))
+    if not status_bits:
+        status_bits.append("clean")
+    if fixed:
+        status_bits.append(f"{fixed} fixed")
+    if skipped:
+        status_bits.append(f"{skipped} skipped")
+
+    meta_extras: list[str] = []
+    if checked:
+        meta_extras.append(f"{checked} file" + ("s" if checked != 1 else ""))
+    if result.duration > 0:
+        if result.duration < 1:
+            meta_extras.append(f"{int(result.duration * 1000)}ms")
+        else:
+            meta_extras.append(f"{result.duration:.2f}s")
+    if reporter and reporter not in ("pretty", ""):
+        meta_extras.append(f"reporter={reporter}")
+
+    meta = _meta_line(
+        "biome",
+        result.exit_code,
+        ", ".join(status_bits),
+        *meta_extras,
+    )
+    parts: list[str] = [meta]
+
+    if config.quiet:
+        return "\n".join(parts)
+
+    if result.lint_issues:
+        grouped: dict[str, list[LintIssue]] = {}
+        severities: dict[str, str] = {}
+        for issue in result.lint_issues:
+            key = issue.code or "unknown"
+            grouped.setdefault(key, []).append(issue)
+            # Keep highest severity per group (error > warning > info)
+            prev = severities.get(key, "info")
+            order = {"error": 3, "warning": 2, "info": 1}
+            if order.get(issue.severity, 0) > order.get(prev, 0):
+                severities[key] = issue.severity
+
+        total_shown = 0
+        sorted_groups = sorted(
+            grouped.items(),
+            key=lambda kv: (
+                -{"error": 3, "warning": 2, "info": 1}.get(severities.get(kv[0], "error"), 0),
+                -len(kv[1]),
+            ),
+        )
+        for code, issues in sorted_groups:
+            if total_shown >= config.max_failures:
+                break
+            msg = issues[0].message or ""
+            if len(msg) > 160:
+                msg = msg[:157] + "..."
+            locs = []
+            for iss in issues[:4]:
+                loc = iss.file
+                if iss.line:
+                    loc += f":{iss.line}"
+                locs.append(loc)
+            loc_str = ", ".join(locs)
+            remaining_in_group = len(issues) - len(locs)
+            if remaining_in_group > 0:
+                loc_str += f" +{remaining_in_group}"
+            sev_tag = ""
+            if severities.get(code) == "warning":
+                sev_tag = " [warn]"
+            elif severities.get(code) == "info":
+                sev_tag = " [info]"
+            parts.append(f"{code} x{len(issues)}{sev_tag}: {msg} [{loc_str}]")
+            total_shown += 1
+
+        remaining_groups = len(grouped) - total_shown
+        if remaining_groups > 0:
+            parts.append(f"+{remaining_groups} more rules")
+
+    if fixable:
+        parts.append(f"{fixable} fixable with --write")
+
+    _maybe_full_path(parts, result)
+    return "\n".join(parts)
+
+
 def format_result(result: Result, config: Config, raw_output: str) -> str:
     """Format the parsed result into maximum token-efficient output for LLM."""
     # Dispatch to specialized formatters for non-test tools
@@ -2028,6 +2384,8 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
         return _format_grep(result, config)
     if result.tool == "ls_tree":
         return _format_ls_tree(result, config)
+    if result.tool == "biome":
+        return _format_biome(result, config)
 
     parts: list[str] = []
 
@@ -2157,6 +2515,10 @@ _JSON_EXTRA_KEYS = {
     "make": ("make_errors", "make_warnings", "make_targets", "make_total_lines"),
     "cargo": ("cargo_errors", "cargo_warnings", "cargo_total_lines"),
     "kubectl": ("kubectl_mode", "kubectl_lines", "kubectl_total"),
+    "biome": (
+        "biome_warnings", "biome_checked", "biome_fixed",
+        "biome_skipped", "biome_fixable", "biome_reporter",
+    ),
 }
 
 
@@ -2409,4 +2771,16 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # Downstream consumer (head, less, grep -m, etc.) closed the pipe.
+        # Silence stderr and exit 0 — same contract as SIG_DFL-handled SIGPIPE.
+        try:
+            sys.stderr.close()
+        except Exception:
+            pass
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.stderr.write("\nwrun: interrupted\n")
+        sys.exit(130)

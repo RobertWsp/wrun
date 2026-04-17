@@ -1,0 +1,22 @@
+./src/foo.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × File content differs from formatting output
+
+    1   │ - function  foo(){
+      1 │ + function foo() {
+    2   │ -     return 1
+      2 │ +   return 1;
+    3 3 │   }
+
+
+./src/bar.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × File content differs from formatting output
+
+    1   │ - const x=1
+      1 │ + const x = 1;
+
+
+Checked 2 files in 3ms. No fixes applied.
+Found 2 errors.
+2 fix applicable with the --write option.

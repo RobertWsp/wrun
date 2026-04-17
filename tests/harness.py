@@ -233,6 +233,206 @@ tests/test_a.py::test_2 PASSED
         expect_contains=["TS2322", "TS2339", "TS2769", "TS1005"],
     ),
     Case(
+        name="biome: pretty reporter 3 errors",
+        input_text=load_corpus("biome_errors"),
+        tool_hint="biome",
+        expect_contains=[
+            "exit:1",
+            "biome",
+            "3 errors",
+            "3 files",
+            "10ms",
+            "lint/suspicious/noExplicitAny",
+            "lint/style/useConst",
+            "lint/correctness/noUnusedVariables",
+            "./src/App.tsx:12",
+            "./src/utils.ts:8",
+            "./src/api/client.ts:45",
+            "Unexpected any",
+            "never reassigned",
+            "variable is unused",
+        ],
+        expect_not_contains=["━━━", ":12:5:0", "failed"],
+    ),
+    Case(
+        name="biome: github actions reporter",
+        input_text=(
+            "::error file=./src/App.tsx,line=12,col=5,title=lint/suspicious/noExplicitAny"
+            "::Unexpected any. Specify a different type.\n"
+            "::error file=./src/utils.ts,line=8,col=1,title=lint/style/useConst"
+            "::let declares a variable that is never reassigned.\n"
+            "Found 2 errors.\n"
+        ),
+        tool_hint="biome",
+        expect_contains=[
+            "biome",
+            "2 errors",
+            "reporter=github",
+            "lint/suspicious/noExplicitAny",
+            "lint/style/useConst",
+            "./src/App.tsx:12",
+            "./src/utils.ts:8",
+        ],
+    ),
+    Case(
+        name="biome: summary reporter (one-line diagnostics)",
+        input_text=(
+            "./src/foo.ts:3:10 lint/style/useConst  × let is never reassigned.\n"
+            "./src/bar.ts:1:1 lint/suspicious/noExplicitAny  × Unexpected any.\n"
+            "Found 2 errors.\n"
+        ),
+        tool_hint="biome",
+        expect_contains=[
+            "2 errors",
+            "./src/foo.ts:3",
+            "./src/bar.ts:1",
+            "let is never reassigned",
+            "Unexpected any",
+        ],
+    ),
+    Case(
+        name="biome: clean run (0 errors, only Checked line)",
+        input_text=load_corpus("biome_clean"),
+        tool_hint="biome",
+        expect_contains=["exit:0", "biome", "clean", "12 files", "8ms"],
+        expect_not_contains=[" error", " warning", "FAIL", "lint/"],
+    ),
+    Case(
+        name="biome: warnings-only run",
+        input_text=load_corpus("biome_warnings"),
+        tool_hint="biome",
+        expect_contains=[
+            "biome",
+            "2 warnings",
+            "2 files",
+            "5ms",
+            "lint/style/useConst",
+            "lint/correctness/noUnusedVariables",
+            "[warn]",
+            "never reassigned",
+            "variable is unused",
+        ],
+        expect_not_contains=[" error"],
+    ),
+    Case(
+        name="biome: mixed errors + warnings + fixable",
+        input_text=load_corpus("biome_mixed"),
+        tool_hint="biome",
+        expect_contains=[
+            "2 errors",
+            "1 warning",
+            "3 files",
+            "15ms",
+            "Unexpected any",
+            "never reassigned",
+            "variable is unused",
+            "1 fixable with --write",
+            "[warn]",
+        ],
+    ),
+    Case(
+        name="biome: parse category (syntax error)",
+        input_text=load_corpus("biome_parse"),
+        tool_hint="biome",
+        expect_contains=[
+            "biome",
+            "1 error",
+            "parse x1",
+            "./src/broken.ts:5",
+            "Expected a semicolon",
+        ],
+    ),
+    Case(
+        name="biome: format category (whole-file diagnostic)",
+        input_text=load_corpus("biome_format"),
+        tool_hint="biome",
+        expect_contains=[
+            "biome",
+            "2 errors",
+            "format x2",
+            "./src/foo.ts",
+            "./src/bar.ts",
+            "2 fixable with --write",
+        ],
+    ),
+    Case(
+        name="biome: many diagnostics + max-failures cap",
+        input_text=load_corpus("biome_many"),
+        tool_hint="biome",
+        flags=["--no-save", "--max-failures", "3"],
+        expect_contains=[
+            "8 errors",
+            "7 warnings",
+            "42ms",
+            "more rules",
+            "8 fixable with --write",
+        ],
+    ),
+    Case(
+        name="biome: JSON reporter (--reporter=json)",
+        input_text=load_corpus("biome_json"),
+        tool_hint="biome",
+        expect_contains=[
+            "biome",
+            "2 errors",
+            "1 warning",
+            "reporter=json",
+            "lint/suspicious/noExplicitAny",
+            "./src/App.tsx",
+            "./src/utils.ts",
+            "[warn]",
+        ],
+    ),
+    Case(
+        name="biome: summary reporter aggregated",
+        input_text=load_corpus("biome_summary"),
+        tool_hint="biome",
+        expect_contains=["biome", "4 errors", "2 warnings", "5 files", "22ms"],
+    ),
+    Case(
+        name="biome: fixable FIXABLE flag + Fixed count",
+        input_text=load_corpus("biome_fixable"),
+        tool_hint="biome",
+        expect_contains=[
+            "1 error",
+            "1 warning",
+            "1 fixed",
+            "2 files",
+            "1 fixable with --write",
+            "lint/suspicious/noDebugger",
+            "lint/style/useConst",
+        ],
+    ),
+    Case(
+        name="biome: quiet mode yields 1 line",
+        input_text=load_corpus("biome_mixed"),
+        tool_hint="biome",
+        flags=["--no-save", "--quiet"],
+        check=lambda o: None
+        if o.stdout.count("\n") == 1
+        else f"got {o.stdout.count(chr(10))} lines",
+    ),
+    Case(
+        name="biome: --json emits biome_* extras",
+        input_text=load_corpus("biome_mixed"),
+        tool_hint="biome",
+        flags=["--no-save", "--json"],
+        expect_json_keys=[
+            "biome_warnings",
+            "biome_checked",
+            "biome_fixable",
+            "biome_reporter",
+            "lint_issues_grouped",
+        ],
+    ),
+    Case(
+        name="biome: JSON reporter JSON passthrough",
+        input_text=load_corpus("biome_json"),
+        tool_hint="biome",
+        flags=["--no-save", "--json"],
+        expect_json_keys=["summary.errors", "biome_warnings", "biome_reporter"],
+    ),
+    Case(
         name="generic: error pattern extraction",
         input_text="""Starting build
 Compiling foo...
@@ -418,6 +618,20 @@ def789ghi012   postgres:15  "postgres"    1 day ago     Up 1 day      0.0.0.0:54
         input_text="CONTAINER ID   IMAGE   COMMAND   CREATED   STATUS   PORTS   NAMES\n",
         tool_hint="docker_ps",
         expect_contains=["docker_ps"],
+    ),
+    Case(
+        name="docker_ps: Paused and Removing states counted as stopped",
+        input_text="""CONTAINER ID   IMAGE        COMMAND       CREATED       STATUS                  PORTS    NAMES
+abc123def456   nginx:1.25   "nginx -g"    2 hours ago   Up 2 hours (healthy)             web
+def789ghi012   postgres:15  "postgres"    1 day ago     Paused                           db
+xyz345lmn678   redis:7      "redis"       3 hours ago   Removing                         cache
+""",
+        tool_hint="docker_ps",
+        check=lambda o: (
+            "missing stopped count"
+            if "2 stopped" not in o.stdout and "1 running" not in o.stdout
+            else None
+        ),
     ),
     Case(
         name="ls_tree: ls -la with noise",
@@ -682,6 +896,43 @@ configmap/app-config created
 ]
 
 
+def _regression_sigpipe_no_traceback() -> tuple[bool, str]:
+    """wrun cmd | head must not leak BrokenPipeError tracebacks to stderr."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        # 3000 lines to guarantee we exceed any pipe buffer
+        for i in range(3000):
+            f.write(f"line {i} with some padding content to fill buffer\n")
+        big_path = f.name
+
+    try:
+        # Spawn wrun producing full output, read 1 byte then close — forces
+        # downstream write failures on every subsequent chunk.
+        proc = subprocess.Popen(
+            WRUN + ["--no-save", "--full", "cat", big_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, "WRUN_AUTO": ""},
+        )
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        proc.stdout.read(1)
+        proc.stdout.close()
+        stderr = proc.stderr.read().decode()
+        exit_code = proc.wait()
+    finally:
+        Path(big_path).unlink(missing_ok=True)
+
+    if "Traceback" in stderr or "BrokenPipeError" in stderr:
+        return False, f"leaked traceback to stderr: {stderr[:200]!r}"
+    # 0 = clean exit, 141 = 128+SIGPIPE (shell convention),
+    # -13 = subprocess negative-signal convention (died from SIGPIPE)
+    if exit_code not in (0, 141, -13):
+        return False, f"unexpected exit_code={exit_code}"
+    return True, ""
+
+
 def _regression_no_dedup() -> tuple[bool, str]:
     import tempfile
 
@@ -750,6 +1001,16 @@ def main() -> int:
     else:
         failed += 1
     print(f"  [{status}]   regression   | no-dedup: {msg}")
+
+    ok, msg = _regression_sigpipe_no_traceback()
+    status = "PASS" if ok else "FAIL"
+    if ok:
+        passed += 1
+    else:
+        failed += 1
+    print(
+        f"  [{status}]   regression   | sigpipe: downstream close leaks no traceback {msg}"
+    )
 
     print("━" * 90)
     print(f"Total: {len(CASES)} | PASS: {passed} | FAIL: {failed}")

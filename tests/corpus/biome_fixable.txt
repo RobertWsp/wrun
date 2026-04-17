@@ -1,0 +1,27 @@
+./src/foo.ts:3:1 lint/style/useConst  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ⚠ This let declares a variable that is never reassigned.
+
+     3 │ let x = 1;
+       │ ^^^^^^^^^^
+
+  ℹ Safe fix: Replace let with const.
+
+     3 │ - let x = 1;
+       │ + const x = 1;
+
+
+./src/bar.ts:10:5 lint/suspicious/noDebugger  FIXABLE  ━━━━━━━━━━━━━━━━━━━━
+
+  × This is an unexpected use of the debugger statement.
+
+     10 │     debugger;
+        │     ^^^^^^^^^
+
+  ℹ Unsafe fix: Remove debugger statement.
+
+
+Checked 2 files in 4ms. Fixed 1 file.
+Found 1 error.
+Found 1 warning.
+1 fix applied. 1 fix applicable with the --write option.

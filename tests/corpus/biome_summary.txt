@@ -1,0 +1,18 @@
+Some of the lint rules were triggered.
+
+lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ℹ This rule was triggered 3 times.
+
+lint/style/useConst ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ℹ This rule was triggered 2 times.
+
+lint/correctness/noUnusedVariables ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ℹ This rule was triggered 1 time.
+
+
+Checked 5 files in 22ms. No fixes applied.
+Found 4 errors.
+Found 2 warnings.

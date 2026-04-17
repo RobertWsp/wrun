@@ -82,7 +82,7 @@ pytest tests/ 2>&1 | wrun --stdin --tool pytest   # pipe mode
 | **pytest** | `PytestParser` | file:line per failure, assertion diff, multi-line messages |
 | **vitest / jest / bun test** | `VitestBunParser` | failure block per test, duration, summary counts |
 | **ruff** | `RuffParser` | classic + Rust-style diagnostics, grouped by rule code |
-| **biome** | `BiomeParser` | diagnostic parsing, grouped |
+| **biome** | `BiomeParser` | 4 reporters (pretty, summary, github, json) · lint/assist/parse/format categories · severity (error/warning) · duration + fixable + checked/fixed/skipped metadata |
 | **tsc / mypy / ty** | `TscParser` | error code + file:line + message |
 
 ### VCS & filesystem tools
@@ -238,7 +238,49 @@ E501 x1: Line too long [src/util.py:88]
 3 fixable with --fix
 ```
 
-## Measured reduction — 35-case harness
+### biome (full reporter coverage: pretty / summary / json / github)
+
+Pretty reporter (default — Rust/miette-style diagnostics with `━ × ⚠ ℹ` glyphs):
+
+```
+exit:1 | biome | 2 errors, 1 warning | 3 files | 15ms
+lint/suspicious/noExplicitAny x1: Unexpected any. Specify a different type. [./src/App.tsx:12]
+lint/correctness/noUnusedVariables x1: This variable is unused. [./src/api/client.ts:45]
+lint/style/useConst x1 [warn]: This let declares a variable that is never reassigned. [./src/utils.ts:8]
+1 fixable with --write
+```
+
+Parse errors (syntax, non-lint category):
+
+```
+exit:1 | biome | 1 error | 1 file | 2ms
+parse x1: Expected a semicolon or an implicit semicolon after a statement, but found none. [./src/broken.ts:5]
+```
+
+Format diagnostics (whole-file, no `:line:col`):
+
+```
+exit:1 | biome | 2 errors | 2 files | 3ms
+format x2: File content differs from formatting output [./src/foo.ts, ./src/bar.ts]
+2 fixable with --write
+```
+
+JSON reporter (`biome check --reporter=json` — structured blob detected + normalized):
+
+```
+exit:1 | biome | 2 errors, 1 warning | 3 files | 15ms | reporter=json
+lint/suspicious/noExplicitAny x1: Unexpected any. Specify a different type. [./src/App.tsx]
+lint/correctness/noUnusedVariables x1: This variable is unused. [./src/api/client.ts]
+lint/style/useConst x1 [warn]: This let declares a variable that is never reassigned. [./src/utils.ts]
+```
+
+Clean run (no diagnostics):
+
+```
+exit:0 | biome | clean | 12 files | 8ms
+```
+
+## Measured reduction — 73-case harness
 
 `tests/harness.py` runs every parser against synthetic + real commands and asserts structural expectations (field presence, counts, line numbers, flags). Run it with:
 
@@ -249,8 +291,7 @@ python3 tests/harness.py
 Current result:
 
 ```
-Total: 35 | PASS: 35 | FAIL: 0
-Aggregated: 29 373 B → 5 313 B  (−82%)
+Total: 73 | PASS: 75 | FAIL: 0
 ```
 
 Selected cases (bytes in → bytes out):

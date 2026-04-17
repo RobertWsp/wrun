@@ -1,0 +1,25 @@
+./src/utils.ts:8:1 lint/style/useConst ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ⚠ This let declares a variable that is never reassigned.
+
+     6 │ let foo = 42;
+       │ ^^^^^^^^^^^^
+
+  ℹ Safe fix: Replace let with const.
+
+
+./src/api/client.ts:45:12 lint/correctness/noUnusedVariables ━━━━━━━━━━━━━━━━━
+
+  ⚠ This variable is unused.
+
+     43 │ async function fetchData() {
+     44 │   const url = "/api";
+     45 │   const result = await fetch(url);
+        │         ^^^^^^
+     46 │ }
+
+  ℹ Unused variables are usually the result of a dead branch.
+
+
+Checked 2 files in 5ms. No fixes applied.
+Found 2 warnings.

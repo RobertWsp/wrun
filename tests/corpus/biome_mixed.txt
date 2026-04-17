@@ -1,0 +1,35 @@
+./src/App.tsx:12:5 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Unexpected any. Specify a different type.
+
+    10 │ function foo(x: any) {
+       │                  ^^^
+
+  ℹ any disables many type checking rules.
+
+
+./src/utils.ts:8:1 lint/style/useConst ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ⚠ This let declares a variable that is never reassigned.
+
+     6 │ let foo = 42;
+       │ ^^^^^^^^^^^^
+
+  ℹ Safe fix: Replace let with const.
+
+
+./src/api/client.ts:45:12 lint/correctness/noUnusedVariables ━━━━━━━━━━━━━━━━━
+
+  × This variable is unused.
+
+     45 │   const result = await fetch(url);
+        │         ^^^^^^
+
+  ℹ Unused variables are usually the result of a dead branch.
+
+
+Checked 3 files in 15ms. No fixes applied.
+Found 2 errors.
+Found 1 warning.
+The number of diagnostics exceeds the limit allowed. Use --max-diagnostics.
+1 fix applicable with the --write option.
