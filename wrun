@@ -48,7 +48,6 @@ Optimization techniques:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -93,52 +92,6 @@ SKIP_FRAMES = {
     "concurrent/futures",
     "threading.py",
 }
-
-SESSION_CACHE_FILE = OUTPUT_DIR / "session_cache.json"
-_SESSION_TTL = 1800   # 30-minute rolling window
-_SESSION_WINDOW = 16  # max entries to keep
-
-
-# ─── Cross-call Dedup ─────────────────────────────────────────────────────────
-
-
-def _load_session_cache() -> dict:
-    try:
-        if SESSION_CACHE_FILE.exists():
-            data = json.loads(SESSION_CACHE_FILE.read_text())
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {}
-
-
-def _save_session_cache(cache: dict) -> None:
-    try:
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = SESSION_CACHE_FILE.with_suffix(f".json.tmp.{os.getpid()}")
-        tmp.write_text(json.dumps(cache, separators=(",", ":")))
-        tmp.replace(SESSION_CACHE_FILE)
-    except Exception:
-        pass
-
-
-def dedup_check_and_record(output: str, tool: str) -> bool:
-    """Single-pass dedup: check + record in one read + one write.
-
-    Returns True if this output was seen recently (caller should short-circuit).
-    """
-    key = hashlib.md5(output.encode("utf-8")).hexdigest()
-    now = time.time()
-    cache = _load_session_cache()
-    entries = [e for e in cache.get("entries", []) if now - e.get("ts", 0) < _SESSION_TTL]
-    is_dup = any(e.get("key") == key and e.get("tool") == tool for e in entries)
-    if not is_dup:
-        entries.append({"key": key, "tool": tool, "ts": now})
-        cache["entries"] = entries[-_SESSION_WINDOW:]
-        _save_session_cache(cache)
-    return is_dup
-
 
 # ─── Data Models ──────────────────────────────────────────────────────────────
 
@@ -2318,11 +2271,6 @@ def run(cmd_parts: list[str], config: Config) -> int:
     # Fallback: detect from output if command detection gave generic
     if tool == "generic":
         tool = detect_tool_from_output(clean_output)
-
-    # Cross-call dedup: suppress identical output seen recently (only when stateful)
-    if not config.no_save and dedup_check_and_record(clean_output, tool):
-        sys.stdout.write(f"exit:{exit_code} | {tool} | (duplicate — identical to recent call)\n")
-        return exit_code
 
     # Parse
     parser = PARSERS.get(tool, PARSERS["generic"])

@@ -682,9 +682,46 @@ configmap/app-config created
 ]
 
 
+def _regression_no_dedup() -> tuple[bool, str]:
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("stable content for dedup regression\n")
+        tmp_path = f.name
+
+    cache = Path.home() / ".local" / "share" / "wrun" / "session_cache.json"
+    cache.unlink(missing_ok=True)
+
+    try:
+        cmd = WRUN + ["cat", tmp_path]
+        env = {**os.environ, "WRUN_AUTO": ""}
+        r1 = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        r2 = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        r3 = subprocess.run(cmd, capture_output=True, text=True, env=env)
+
+        for i, r in enumerate((r1, r2, r3), 1):
+            if "duplicate" in r.stdout.lower():
+                return False, f"call #{i} returned '(duplicate)' marker: {r.stdout!r}"
+            if r.returncode != 0:
+                return (
+                    False,
+                    f"call #{i} failed: exit={r.returncode}, stdout={r.stdout!r}",
+                )
+
+        if not (r1.stdout == r2.stdout == r3.stdout):
+            return False, "repeated calls produced different output"
+
+        if cache.exists():
+            return False, f"cache file recreated at {cache}"
+
+        return True, "3 identical calls, no '(duplicate)' marker, no cache file"
+    finally:
+        os.unlink(tmp_path)
+
+
 def main() -> int:
     print("━" * 90)
-    print(f"wrun harness — {len(CASES)} cases")
+    print(f"wrun harness — {len(CASES)} cases + 1 regression")
     print("━" * 90)
     passed = failed = 0
     sum_raw = sum_wrun = 0
@@ -705,6 +742,14 @@ def main() -> int:
         print(
             f"  [{status}] {out.raw_bytes:>6}B→{out.wrun_bytes:>4}B {reduction:>5} | {case.name}"
         )
+
+    ok, msg = _regression_no_dedup()
+    status = "PASS" if ok else "FAIL"
+    if ok:
+        passed += 1
+    else:
+        failed += 1
+    print(f"  [{status}]   regression   | no-dedup: {msg}")
 
     print("━" * 90)
     print(f"Total: {len(CASES)} | PASS: {passed} | FAIL: {failed}")
