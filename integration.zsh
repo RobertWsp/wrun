@@ -14,7 +14,28 @@
 # Guard: only define once
 (( ${+functions[_wrun_active]} )) && return
 
-_wrun_active() {
+# ─── Alias hygiene ───────────────────────────────────────────────────────────
+# If the user (or a plugin) aliased any command we wrap, zsh would expand the
+# alias on our function header:
+#   alias rg='rg --smart-case'  +  rg() { ... }  →  rg --smart-case() { ... }
+#   → parse error near `()'
+# Strip those aliases *before* defining the wrappers. User-defined flag-style
+# aliases are lost on purpose — the wrapper forwards all "$@" to `command rg`,
+# so re-applying default flags via `WRUN_RG_FLAGS` or a post-source realias is
+# on the user.
+_wrun_wrapped=(
+    pytest py.test vitest jest mypy
+    uv bun npx bunx
+    ruff biome tsc
+    git docker
+    grep rg ls tree
+)
+for _wrun_name in "${_wrun_wrapped[@]}"; do
+    unalias "$_wrun_name" 2>/dev/null
+done
+unset _wrun_name _wrun_wrapped
+
+function _wrun_active {
     [[ "$WRUN_AUTO" == "1" ]]
 }
 
