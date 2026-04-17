@@ -29,6 +29,7 @@ _wrun_wrapped=(
     ruff biome tsc
     git docker
     grep rg ls tree
+    make kubectl
 )
 for _wrun_name in "${_wrun_wrapped[@]}"; do
     unalias "$_wrun_name" 2>/dev/null
@@ -177,18 +178,30 @@ git() {
 }
 
 # ─── docker wrapper ──────────────────────────────────────────────────────────
-# Wraps: docker ps, docker images
+# Wraps: docker ps, docker images, docker logs
 
 docker() {
     if _wrun_active; then
         case "$1" in
-            ps|images)
+            ps|images|logs)
                 command wrun docker "$@"
                 return $?
                 ;;
         esac
     fi
     command docker "$@"
+}
+
+# ─── make wrapper ────────────────────────────────────────────────────────────
+
+make() {
+    if _wrun_active; then command wrun make "$@"; else command make "$@"; fi
+}
+
+# ─── kubectl wrapper ─────────────────────────────────────────────────────────
+
+kubectl() {
+    if _wrun_active; then command wrun kubectl "$@"; else command kubectl "$@"; fi
 }
 
 # ─── grep/rg wrapper ─────────────────────────────────────────────────────────

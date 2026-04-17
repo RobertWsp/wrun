@@ -48,6 +48,7 @@ Optimization techniques:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -92,6 +93,51 @@ SKIP_FRAMES = {
     "concurrent/futures",
     "threading.py",
 }
+
+SESSION_CACHE_FILE = OUTPUT_DIR / "session_cache.json"
+_SESSION_TTL = 1800   # 30-minute rolling window
+_SESSION_WINDOW = 16  # max entries to keep
+
+
+# ─── Cross-call Dedup ─────────────────────────────────────────────────────────
+
+
+def _load_session_cache() -> dict:
+    try:
+        if SESSION_CACHE_FILE.exists():
+            data = json.loads(SESSION_CACHE_FILE.read_text())
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_session_cache(cache: dict) -> None:
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SESSION_CACHE_FILE.with_suffix(f".json.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(cache, separators=(",", ":")))
+        tmp.replace(SESSION_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def dedup_check_and_record(output: str, tool: str) -> bool:
+    """Single-pass dedup: check + record in one read + one write.
+
+    Returns True if this output was seen recently (caller should short-circuit).
+    """
+    key = hashlib.md5(output.encode("utf-8")).hexdigest()
+    now = time.time()
+    cache = _load_session_cache()
+    entries = [e for e in cache.get("entries", []) if now - e.get("ts", 0) < _SESSION_TTL]
+    is_dup = any(e.get("key") == key and e.get("tool") == tool for e in entries)
+    if not is_dup:
+        entries.append({"key": key, "tool": tool, "ts": now})
+        cache["entries"] = entries[-_SESSION_WINDOW:]
+        _save_session_cache(cache)
+    return is_dup
 
 
 # ─── Data Models ──────────────────────────────────────────────────────────────
@@ -308,6 +354,7 @@ DOCKER_SUBCOMMANDS = {
     "images": "docker_ps",
     "image": "docker_ps",
     "container": "docker_ps",
+    "logs": "docker_logs",
 }
 
 
@@ -345,8 +392,21 @@ def detect_tool(cmd_parts: list[str]) -> str:
             # Disambiguate: `docker container ls`, `docker image ls`
             if sub in ("container", "image") and len(cmd_parts) > 2 and cmd_parts[2].lower() in ("ls", "list"):
                 return "docker_ps"
-            if sub == "ps" or sub == "images":
-                return "docker_ps"
+            return DOCKER_SUBCOMMANDS[sub]
+
+    # Make / cmake
+    if cmd0 in ("make", "cmake"):
+        return "make"
+
+    # kubectl
+    if cmd0 == "kubectl":
+        return "kubectl"
+
+    # cargo
+    if cmd0 == "cargo" and len(cmd_parts) > 1:
+        sub = cmd_parts[1].lower()
+        if sub in ("build", "test", "check", "run", "clippy"):
+            return "cargo"
 
     # Fallback: TOOL_MAP substring matching for test runners and linters
     cmd_str = " ".join(cmd_parts).lower()
@@ -365,9 +425,10 @@ def detect_tool(cmd_parts: list[str]) -> str:
 
 def detect_tool_from_output(output: str) -> str:
     """Fallback: detect tool from output patterns when command detection fails."""
-    # Check first and last 30 lines for known patterns
+    # Check first and last 30 lines, capping each to 2KB to prevent
+    # regex catastrophic backtracking on malformed/huge single lines.
     lines = output.splitlines()
-    sample = "\n".join(lines[:30] + lines[-30:])
+    sample = "\n".join(line[:2048] for line in lines[:30] + lines[-30:])
 
     if "pytest" in sample or "test session starts" in sample or "short test summary info" in sample:
         return "pytest"
@@ -382,6 +443,10 @@ def detect_tool_from_output(output: str) -> str:
         if "TS" in sample:
             return "tsc"
         return "ruff_check"
+    if re.search(r"^error(?:\[\w+\])?:", sample, re.MULTILINE) and "-->" in sample:
+        return "cargo"
+    if re.search(r"^make\[\d+\]:", sample, re.MULTILINE):
+        return "make"
     return "generic"
 
 
@@ -1243,6 +1308,135 @@ class DockerPsParser(Parser):
         return [c for c in cls.MULTI_SPACE_RE.split(line.strip()) if c]
 
 
+class DockerLogsParser(Parser):
+    """Parse `docker logs`: strip timestamps, surface top-5 errors + 30-line tail."""
+
+    TIMESTAMP_RE = re.compile(
+        r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\s*"
+    )
+    ERROR_RE = re.compile(r"(?i)error|exception|fatal|panic|traceback|critical")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="docker_logs", exit_code=0, duration=0)
+        lines = output.splitlines()
+
+        stripped: list[str] = []
+        for line in lines:
+            stripped.append(self.TIMESTAMP_RE.sub("", line, count=1))
+
+        error_lines: list[str] = []
+        for line in stripped:
+            if self.ERROR_RE.search(line):
+                error_lines.append(line)
+                if len(error_lines) >= 5:
+                    break
+
+        result.extra["docker_logs_errors"] = error_lines
+        result.extra["docker_logs_tail"] = stripped[-30:] if len(stripped) > 30 else stripped
+        result.extra["docker_logs_total"] = len(lines)
+        return result
+
+
+class MakeParser(Parser):
+    """Parse `make` / `cmake --build` / `ninja` output: extract errors, warnings, targets."""
+
+    ERROR_RE = re.compile(r"(?i)\b(?:error|fatal error):\s*(.+)$")
+    WARNING_RE = re.compile(r"(?i)\bwarning:\s*(.+)$")
+    TARGET_RE = re.compile(r"^(?:Making\s+\S+|make\[\d+\]:|cmake\b|ninja:\s)")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="make", exit_code=0, duration=0)
+        lines = output.splitlines()
+        errors: list[str] = []
+        warnings: list[str] = []
+        targets: list[str] = []
+
+        for line in lines:
+            if self.ERROR_RE.search(line):
+                errors.append(line.strip())
+            elif self.WARNING_RE.search(line):
+                warnings.append(line.strip())
+            elif self.TARGET_RE.match(line):
+                targets.append(line.strip())
+
+        result.errors = len(errors)
+        result.extra["make_errors"] = errors[:config.max_failures]
+        result.extra["make_warnings"] = warnings[:config.max_failures]
+        result.extra["make_targets"] = targets[-5:]
+        result.extra["make_total_lines"] = len(lines)
+        return result
+
+
+class CargoParser(Parser):
+    """Parse `cargo build` / `cargo test` / `cargo clippy`: group errors by code."""
+
+    ERROR_CODE_RE = re.compile(r"^error(?:\[(\w+)\])?: (.+)$")
+    LOCATION_RE = re.compile(r"^\s+-->\s+(.+):(\d+):\d+$")
+    WARNING_RE = re.compile(r"^warning(?:\[(\w+)\])?: .+$")
+    TEST_FAIL_RE = re.compile(r"^test\s+(\S+)\s+\.\.\.\s+FAILED$")
+    PANIC_RE = re.compile(r"^thread\s+'([^']+)'\s+panicked at\s+'([^']+)'(?:,\s+(\S+):(\d+):\d+)?")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="cargo", exit_code=0, duration=0)
+        lines = output.splitlines()
+        errors: list[dict] = []
+        warnings_count = 0
+        i = 0
+        while i < len(lines):
+            m = self.ERROR_CODE_RE.match(lines[i])
+            if m:
+                code = m.group(1) or "E????"
+                msg = m.group(2)
+                loc = ""
+                if i + 1 < len(lines):
+                    lm = self.LOCATION_RE.match(lines[i + 1])
+                    if lm:
+                        loc = f"{lm.group(1)}:{lm.group(2)}"
+                        i += 1
+                errors.append({"code": code, "msg": msg, "loc": loc})
+            elif self.WARNING_RE.match(lines[i]):
+                warnings_count += 1
+            else:
+                tm = self.TEST_FAIL_RE.match(lines[i])
+                if tm:
+                    errors.append({"code": "TEST", "msg": f"test {tm.group(1)} failed", "loc": ""})
+                else:
+                    pm = self.PANIC_RE.match(lines[i])
+                    if pm:
+                        loc = f"{pm.group(3)}:{pm.group(4)}" if pm.group(3) else ""
+                        errors.append({"code": "PANIC", "msg": f"{pm.group(1)}: {pm.group(2)}", "loc": loc})
+            i += 1
+
+        result.errors = len(errors)
+        result.extra["cargo_errors"] = errors[:config.max_failures]
+        result.extra["cargo_warnings"] = warnings_count
+        result.extra["cargo_total_lines"] = len(lines)
+        return result
+
+
+class KubectlParser(Parser):
+    """Parse kubectl output: detect mode (table/describe/logs/apply) and summarize."""
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="kubectl", exit_code=0, duration=0)
+        lines = [ln for ln in output.splitlines() if ln.strip()]
+        first = lines[0] if lines else ""
+
+        if first.startswith("NAME") or (len(lines) > 1 and "   " in first):
+            mode = "table"
+        elif first.startswith(("Name:", "Namespace:", "Labels:")):
+            mode = "describe"
+        elif any(kw in output for kw in ("configured", "created", "deleted", "unchanged")):
+            mode = "apply"
+        else:
+            mode = "logs"
+
+        result.extra["kubectl_mode"] = mode
+        result.extra["kubectl_lines"] = lines
+        result.extra["kubectl_total"] = len(lines)
+        return result
+
+
 class GrepRgParser(Parser):
     """Parse grep/rg/ag output. Groups matches by file, caps per-file and total."""
 
@@ -1435,17 +1629,35 @@ class GenericParser(Parser):
         re.MULTILINE,
     )
 
+    _SUMMARY_THRESHOLD = 500
+    _BENIGN_THRESHOLD = 1000
+
+    def _is_benign(self, output: str) -> bool:
+        return not self.ERROR_PATTERNS.search(output)
+
+    @staticmethod
+    def _build_summary(lines: list[str], total: int) -> list[str]:
+        if total <= 15:
+            return lines
+        return lines[:5] + [f"... ({total - 15} lines hidden)"] + lines[-10:]
+
     def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
         result = Result(tool="generic", exit_code=0, duration=0)
-        # Store error-extracted lines for the formatter
         lines = output.splitlines()
+        total = len(lines)
+
+        # Very long benign output (install/download logs): just summarize
+        if total > self._BENIGN_THRESHOLD and self._is_benign(output):
+            result.extra["error_lines"] = []
+            result.extra["total_lines"] = total
+            result.extra["summarized"] = self._build_summary(lines, total)
+            return result
+
         error_lines: list[str] = []
         seen_indices: set[int] = set()
 
         for m in self.ERROR_PATTERNS.finditer(output):
-            # Find line index
             line_start = output.count("\n", 0, m.start())
-            # Get context: 1 line before + error + 2 lines after
             for idx in range(max(0, line_start - 1), min(len(lines), line_start + 3)):
                 if idx not in seen_indices:
                     seen_indices.add(idx)
@@ -1453,8 +1665,15 @@ class GenericParser(Parser):
             if len(error_lines) >= config.max_lines * 2:
                 break
 
+        # No errors found but output is large: summarize instead of showing nothing
+        if not error_lines and total > self._SUMMARY_THRESHOLD:
+            result.extra["error_lines"] = []
+            result.extra["total_lines"] = total
+            result.extra["summarized"] = self._build_summary(lines, total)
+            return result
+
         result.extra["error_lines"] = error_lines
-        result.extra["total_lines"] = len(lines)
+        result.extra["total_lines"] = total
         return result
 
 
@@ -1476,6 +1695,10 @@ PARSERS: dict[str, Parser] = {
     "git_log": GitLogParser(),
     "git_write": GitWriteParser(),
     "docker_ps": DockerPsParser(),
+    "docker_logs": DockerLogsParser(),
+    "make": MakeParser(),
+    "cargo": CargoParser(),
+    "kubectl": KubectlParser(),
     "grep": GrepRgParser(),
     "ls_tree": LsTreeParser(),
     "generic": GenericParser(),
@@ -1753,6 +1976,80 @@ def _format_ls_tree(result: Result, config: Config) -> str:
     return "\n".join(parts)
 
 
+def _format_docker_logs(result: Result, config: Config) -> str:
+    errors = result.extra.get("docker_logs_errors", [])
+    tail = result.extra.get("docker_logs_tail", [])
+    total = result.extra.get("docker_logs_total", 0)
+    parts: list[str] = [_meta_line("docker_logs", result.exit_code, f"{total} lines")]
+    if config.quiet:
+        return "\n".join(parts)
+    if errors:
+        parts.append(f"errors ({len(errors)}):")
+        parts.extend(f"  {e}" for e in errors)
+    shown = tail[-30:]
+    if total > len(shown):
+        parts.append(f"--- last {len(shown)} lines ---")
+    parts.extend(shown)
+    _maybe_full_path(parts, result)
+    return "\n".join(parts)
+
+
+def _format_make(result: Result, config: Config) -> str:
+    errors = result.extra.get("make_errors", [])
+    warnings = result.extra.get("make_warnings", [])
+    targets = result.extra.get("make_targets", [])
+    total_errors = result.errors
+    warn_count = len(warnings)
+    parts: list[str] = [_meta_line("make", result.exit_code, f"{total_errors} errors", f"{warn_count} warnings")]
+    if config.quiet:
+        return "\n".join(parts)
+    for e in errors:
+        parts.append(f"ERR {e}")
+    hidden_errors = total_errors - len(errors)
+    if hidden_errors > 0:
+        parts.append(f"+{hidden_errors} more errors")
+    for w in warnings[:3]:
+        parts.append(f"WRN {w}")
+    if warn_count > 3:
+        parts.append(f"+{warn_count - 3} more warnings")
+    if targets:
+        parts.append("targets: " + " | ".join(targets))
+    _maybe_full_path(parts, result)
+    return "\n".join(parts)
+
+
+def _format_cargo_build(result: Result, config: Config) -> str:
+    errors = result.extra.get("cargo_errors", [])
+    warnings = result.extra.get("cargo_warnings", 0)
+    total_errors = result.errors
+    parts: list[str] = [_meta_line("cargo", result.exit_code, f"{total_errors} errors", f"{warnings} warnings")]
+    if config.quiet:
+        return "\n".join(parts)
+    for e in errors:
+        loc = f" [{e['loc']}]" if e.get("loc") else ""
+        parts.append(f"{e['code']}: {e['msg']}{loc}")
+    hidden = total_errors - len(errors)
+    if hidden > 0:
+        parts.append(f"+{hidden} more errors")
+    _maybe_full_path(parts, result)
+    return "\n".join(parts)
+
+
+def _format_kubectl(result: Result, config: Config) -> str:
+    mode = result.extra.get("kubectl_mode", "")
+    lines = result.extra.get("kubectl_lines", [])
+    total = result.extra.get("kubectl_total", 0)
+    parts: list[str] = [_meta_line("kubectl", result.exit_code, mode, f"{total} lines")]
+    if config.quiet:
+        return "\n".join(parts)
+    cap = 30
+    parts.extend(lines[:cap])
+    if total > cap:
+        parts.append(f"+{total - cap} more lines")
+    _maybe_full_path(parts, result)
+    return "\n".join(parts)
+
+
 def format_result(result: Result, config: Config, raw_output: str) -> str:
     """Format the parsed result into maximum token-efficient output for LLM."""
     # Dispatch to specialized formatters for non-test tools
@@ -1766,6 +2063,14 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
         return _format_git_write(result, config)
     if result.tool == "docker_ps":
         return _format_docker_ps(result, config)
+    if result.tool == "docker_logs":
+        return _format_docker_logs(result, config)
+    if result.tool == "make":
+        return _format_make(result, config)
+    if result.tool == "cargo":
+        return _format_cargo_build(result, config)
+    if result.tool == "kubectl":
+        return _format_kubectl(result, config)
     if result.tool == "grep":
         return _format_grep(result, config)
     if result.tool == "ls_tree":
@@ -1798,7 +2103,7 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
     if config.quiet:
         return "\n".join(parts)
     # ── Passing with nothing to report: 1 line ──
-    has_generic_errors = result.tool == "generic" and result.extra.get("error_lines")
+    has_generic_errors = result.tool == "generic" and (result.extra.get("error_lines") or result.extra.get("summarized"))
     if (
         result.exit_code == 0
         and not result.failures
@@ -1855,8 +2160,9 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
 
     # ── Generic fallback: error extraction or head+tail ──
     # Always render extracted errors (exit_code may be 0 in stdin mode even when errors exist)
-    if result.tool == "generic" and (result.exit_code != 0 or result.extra.get("error_lines")):
+    if result.tool == "generic" and (result.exit_code != 0 or result.extra.get("error_lines") or result.extra.get("summarized")):
         error_lines = result.extra.get("error_lines", [])
+        summarized = result.extra.get("summarized")
         total = result.extra.get("total_lines", 0)
 
         if error_lines:
@@ -1867,6 +2173,9 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
                 parts.append(line)
             if total > len(clean):
                 parts.append(f"... ({total - len(clean)} lines hidden, {total} total)")
+        elif summarized:
+            for line in summarized:
+                parts.append(line)
         else:
             # Fallback: head+tail truncation
             raw_lines = raw_output.splitlines()
@@ -1888,6 +2197,14 @@ def format_result(result: Result, config: Config, raw_output: str) -> str:
     _maybe_full_path(parts, result)
 
     return "\n".join(parts)
+
+
+_JSON_EXTRA_KEYS = {
+    "docker_logs": ("docker_logs_errors", "docker_logs_tail", "docker_logs_total"),
+    "make": ("make_errors", "make_warnings", "make_targets", "make_total_lines"),
+    "cargo": ("cargo_errors", "cargo_warnings", "cargo_total_lines"),
+    "kubectl": ("kubectl_mode", "kubectl_lines", "kubectl_total"),
+}
 
 
 def format_json(result: Result) -> str:
@@ -1917,6 +2234,10 @@ def format_json(result: Result) -> str:
             grouped.setdefault(key, []).append(asdict(iss))
         data["lint_issues_grouped"] = grouped
 
+    for key in _JSON_EXTRA_KEYS.get(result.tool, ()):
+        if key in result.extra:
+            data[key] = result.extra[key]
+
     return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -1926,14 +2247,29 @@ def format_json(result: Result) -> str:
 def save_raw_output(output: str, tool: str) -> str:
     """Save full output to disk, return path."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:20]  # Include microseconds to avoid collision
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:20]
     path = OUTPUT_DIR / f"{ts}-{tool}.log"
-    path.write_text(output, encoding="utf-8")
+    try:
+        path.write_text(output, encoding="utf-8")
+    except OSError:
+        return ""
 
-    # Cleanup old files (keep last 20)
-    logs = sorted(OUTPUT_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in logs[20:]:
-        old.unlink(missing_ok=True)
+    # Cleanup old files (keep last 20). Tolerate concurrent deletes / stat races.
+    try:
+        entries: list[tuple[float, Path]] = []
+        for p in OUTPUT_DIR.glob("*.log"):
+            try:
+                entries.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
+        entries.sort(reverse=True)
+        for _, old in entries[20:]:
+            try:
+                old.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
     return str(path)
 
@@ -1982,6 +2318,11 @@ def run(cmd_parts: list[str], config: Config) -> int:
     # Fallback: detect from output if command detection gave generic
     if tool == "generic":
         tool = detect_tool_from_output(clean_output)
+
+    # Cross-call dedup: suppress identical output seen recently (only when stateful)
+    if not config.no_save and dedup_check_and_record(clean_output, tool):
+        sys.stdout.write(f"exit:{exit_code} | {tool} | (duplicate — identical to recent call)\n")
+        return exit_code
 
     # Parse
     parser = PARSERS.get(tool, PARSERS["generic"])

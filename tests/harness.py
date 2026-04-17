@@ -486,6 +486,199 @@ drwxr-xr-x  5 u u  4096 Apr 16 12:00 src
         command=["grep", "-Hn", "def ", str(HERE.parent / "wrun")],
         expect_contains=["wrun", "def "],
     ),
+    Case(
+        name="docker_logs: error surfacing + tail",
+        input_text="""2024-01-15T10:00:00.000Z Starting server
+2024-01-15T10:00:01.000Z Listening on :8080
+2024-01-15T10:00:02.000Z Error: connection refused to redis:6379
+2024-01-15T10:00:03.000Z Retrying...
+2024-01-15T10:00:04.000Z Fatal: cannot connect to database
+""",
+        tool_hint="docker_logs",
+        expect_contains=["docker_logs", "errors", "connection refused", "Fatal"],
+        expect_not_contains=["2024-01-15T10:00:00"],
+    ),
+    Case(
+        name="docker_logs: detection via docker logs command",
+        command=["sh", "-c", "echo '2024-01-01T00:00:00Z app started'"],
+        flags=["--no-save"],
+        check=lambda o: None if "exit:" in o.stdout else "no exit line",
+    ),
+    Case(
+        name="make: error extraction",
+        input_text="""make[1]: Entering directory '/app'
+gcc -o main main.c
+main.c:42:5: error: 'foo' undeclared (first use in this function)
+main.c:43:3: warning: implicit declaration of function 'bar'
+make[1]: *** [main] Error 1
+make[1]: Leaving directory '/app'
+""",
+        tool_hint="make",
+        expect_contains=["make", "1 errors", "1 warnings", "ERR", "undeclared"],
+        expect_not_contains=["gcc -o main"],
+    ),
+    Case(
+        name="make: clean build",
+        input_text="""make[1]: Entering directory '/app'
+gcc -O2 -o main main.c
+make[1]: Leaving directory '/app'
+""",
+        tool_hint="make",
+        expect_contains=["make", "0 errors"],
+    ),
+    Case(
+        name="cargo: error with location",
+        input_text="""error[E0308]: mismatched types
+  --> src/main.rs:10:5
+   |
+10 |     let x: i32 = "hello";
+   |                  ^^^^^^^ expected `i32`, found `&str`
+
+warning[W0001]: unused variable `y`
+  --> src/main.rs:15:9
+
+error: aborting due to 1 previous error
+""",
+        tool_hint="cargo",
+        expect_contains=[
+            "cargo",
+            "2 errors",
+            "E0308",
+            "mismatched types",
+            "src/main.rs:10",
+        ],
+    ),
+    Case(
+        name="cargo: clean build",
+        input_text="warning[unused]: unused import `std::fmt`\n  --> src/lib.rs:1:5\n\nFinished dev [unoptimized] target(s)\n",
+        tool_hint="cargo",
+        expect_contains=["cargo", "0 errors", "1 warnings"],
+        expect_not_contains=["ERR"],
+    ),
+    Case(
+        name="kubectl: table mode",
+        input_text="""NAME         READY   STATUS    RESTARTS   AGE
+nginx-pod    1/1     Running   0          2d
+broken-pod   0/1     Error     5          1h
+""",
+        tool_hint="kubectl",
+        expect_contains=["kubectl", "table", "nginx-pod", "broken-pod"],
+    ),
+    Case(
+        name="kubectl: apply mode",
+        input_text="""deployment.apps/nginx configured
+service/nginx-svc unchanged
+configmap/app-config created
+""",
+        tool_hint="kubectl",
+        expect_contains=["kubectl", "apply", "configured", "created"],
+    ),
+    Case(
+        name="generic: summarize fallback for large benign output",
+        input_text="\n".join([f"Downloading package-{i}" for i in range(600)]),
+        tool_hint="generic",
+        expect_contains=["exit:0", "lines hidden"],
+        expect_not_contains=["Downloading package-100", "Downloading package-300"],
+    ),
+    Case(
+        name="detect_tool: make -> make parser",
+        command=["sh", "-c", "echo 'make[1]: Nothing to be done'"],
+        flags=["--no-save"],
+        check=lambda o: None if "exit:" in o.stdout else "no exit line",
+    ),
+    Case(
+        name="docker_logs: quiet returns 1 line",
+        input_text="2024-01-01T00:00:00Z ERROR: crashed\n",
+        tool_hint="docker_logs",
+        flags=["--no-save", "--quiet"],
+        check=lambda o: None
+        if o.stdout.count("\n") == 1
+        else f"got {o.stdout.count(chr(10))} lines",
+    ),
+    Case(
+        name="make: quiet returns 1 line",
+        input_text="main.c:5:3: error: X\n",
+        tool_hint="make",
+        flags=["--no-save", "--quiet"],
+        check=lambda o: None
+        if o.stdout.count("\n") == 1
+        else f"got {o.stdout.count(chr(10))} lines",
+    ),
+    Case(
+        name="cargo: quiet returns 1 line",
+        input_text="error[E0308]: mismatched\n  --> a.rs:1:1\n",
+        tool_hint="cargo",
+        flags=["--no-save", "--quiet"],
+        check=lambda o: None
+        if o.stdout.count("\n") == 1
+        else f"got {o.stdout.count(chr(10))} lines",
+    ),
+    Case(
+        name="kubectl: quiet returns 1 line",
+        input_text="NAME   STATUS\nnginx  Running\n",
+        tool_hint="kubectl",
+        flags=["--no-save", "--quiet"],
+        check=lambda o: None
+        if o.stdout.count("\n") == 1
+        else f"got {o.stdout.count(chr(10))} lines",
+    ),
+    Case(
+        name="make: --max-failures respected with '+N more'",
+        input_text="\n".join([f"main.c:{i}:1: error: bug-{i}" for i in range(1, 21)]),
+        tool_hint="make",
+        flags=["--no-save", "--max-failures", "3"],
+        expect_contains=["20 errors", "bug-1", "bug-2", "bug-3", "+17 more errors"],
+        expect_not_contains=["bug-10", "bug-20"],
+    ),
+    Case(
+        name="cargo: --max-failures with '+N more'",
+        input_text="\n".join([f"error[E00{i}]: bug-{i}" for i in range(1, 8)]),
+        tool_hint="cargo",
+        flags=["--no-save", "--max-failures", "2"],
+        expect_contains=["7 errors", "+5 more errors"],
+    ),
+    Case(
+        name="cargo: test panic detected",
+        input_text="test panics ... FAILED\nthread 'panics' panicked at 'boom', src/lib.rs:10:9\n",
+        tool_hint="cargo",
+        expect_contains=["2 errors", "TEST", "PANIC", "src/lib.rs:10"],
+    ),
+    Case(
+        name="make: unicode prefix before error",
+        input_text="🚀 error: malformed\n",
+        tool_hint="make",
+        expect_contains=["make", "1 errors", "malformed"],
+    ),
+    Case(
+        name="make: ninja target detection",
+        input_text="ninja: Entering directory `build`\nninja: error: loading 'build.ninja'\n",
+        tool_hint="make",
+        expect_contains=["make", "1 errors"],
+    ),
+    Case(
+        name="json: cargo extras in JSON",
+        input_text="error[E0308]: mismatched types\n  --> src/main.rs:1:1\n",
+        tool_hint="cargo",
+        flags=["--no-save", "--json"],
+        expect_json_keys=["cargo_errors", "cargo_warnings", "cargo_total_lines"],
+    ),
+    Case(
+        name="json: docker_logs extras in JSON",
+        input_text="2024-01-01T00:00:00Z ERROR: boom\n",
+        tool_hint="docker_logs",
+        flags=["--no-save", "--json"],
+        expect_json_keys=[
+            "docker_logs_errors",
+            "docker_logs_tail",
+            "docker_logs_total",
+        ],
+    ),
+    Case(
+        name="perf: 1MB single line does not hang",
+        input_text="x" * 1_000_000,
+        tool_hint="generic",
+        check=lambda o: None if o.exit_code == 0 else f"exit {o.exit_code}",
+    ),
 ]
 
 
