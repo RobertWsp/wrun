@@ -1,0 +1,7 @@
+# Local agent scratchpad (Sisyphus plans, autoplanning state)
+.sisyphus/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
