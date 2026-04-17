@@ -342,26 +342,35 @@ Selected cases (bytes in → bytes out):
 | generic error-pattern extraction | 190 B | 205 B | +8% |
 | 10 KB minified-style long line | 10 008 B | 521 B | **−95%** |
 
-**Biome cases (synthetic + real Biome 2.4.12 output)**:
+**Biome cases (synthetic + real Biome 2.4.12 output) — bytes AND tokens**:
 
-| Case | Raw | Wrun | Δ |
-|---|---:|---:|---:|
-| biome pretty 3 errors (synthetic) | 1 104 B | 325 B | **−71%** |
-| biome warnings-only | 745 B | 245 B | **−68%** |
-| biome mixed err+warn+fixable | 1 089 B | 366 B | **−67%** |
-| biome format category | 760 B | 149 B | **−81%** |
-| biome many (15 diagnostics) | 2 906 B | 395 B | **−87%** |
-| biome summary reporter aggregated | 742 B | 55 B | **−93%** |
-| biome quiet mode | 1 089 B | 54 B | **−96%** |
-| **biome REAL 2.x pretty single-file** | 3 962 B | 552 B | **−87%** |
-| **biome REAL 2.x pretty multi-file (15 diags)** | 9 025 B | 813 B | **−91%** |
-| **biome REAL 2.x github reporter** | 2 356 B | 800 B | **−67%** |
-| **biome REAL 2.x summary reporter** | 1 881 B | 73 B | **−97%** |
-| **biome REAL 2.x JSON reporter** | 4 045 B | 806 B | **−81%** |
-| **biome REAL 2.x format-only** | 883 B | 126 B | **−86%** |
-| **biome REAL 2.x assist/organizeImports** | 1 523 B | 210 B | **−87%** |
+Tokens measured with [tiktoken](https://github.com/openai/tiktoken) using the `cl100k_base` encoding (GPT-4's BPE — a widely-used proxy for modern LLM token accounting, including Claude and Gemini which use similar BPE granularity). Run the report yourself with:
 
-Real Biome 2.4.12 output is verbose — Rust/miette-style diagnostics with code frames, multi-line advices, `━` separators, and a trailing `check ━` footer. Wrun groups diagnostics by rule, shows `severity` tags, and compresses the run summary (`Checked N in Xms. Found X errors. Found Y warnings.`) into a single meta line. The summary reporter case (−97%) is the biggest win — aggregated table of 6 rules becomes `exit:1 | biome | 9 errors, 6 warnings | 6 files | 2ms | reporter=summary`.
+```bash
+pip install --user tiktoken
+python3 tests/token_report.py
+```
+
+| Case | Raw B | Wrun B | Raw tok | Wrun tok | Δ bytes | Δ tokens |
+|---|---:|---:|---:|---:|---:|---:|
+| biome pretty 3 errors (synthetic) | 1 104 | 325 | 278 | 95 | **−71%** | **−66%** |
+| biome warnings-only | 745 | 245 | 190 | 72 | **−68%** | **−62%** |
+| biome mixed err+warn+fixable | 1 089 | 366 | 262 | 108 | **−67%** | **−59%** |
+| biome format category | 760 | 149 | 185 | 46 | **−81%** | **−75%** |
+| biome many (15 diagnostics) | 2 906 | 395 | 678 | 134 | **−87%** | **−80%** |
+| biome summary reporter aggregated | 742 | 55 | 159 | 22 | **−93%** | **−86%** |
+| biome quiet mode | 1 089 | 54 | 262 | 22 | **−96%** | **−92%** |
+| **biome REAL 2.x pretty single-file** | 3 962 | 552 | 1 083 | 155 | **−86%** | **−86%** |
+| **biome REAL 2.x pretty multi-file (15 diags)** | 9 025 | 813 | 2 423 | 235 | **−91%** | **−90%** |
+| **biome REAL 2.x github reporter** | 2 356 | 800 | 601 | 232 | **−67%** | **−61%** |
+| **biome REAL 2.x summary reporter** | 1 881 | 73 | 409 | 26 | **−97%** | **−94%** |
+| **biome REAL 2.x JSON reporter** | 4 045 | 806 | 1 015 | 231 | **−81%** | **−77%** |
+| **biome REAL 2.x format-only** | 883 | 126 | 198 | 38 | **−86%** | **−81%** |
+| **biome REAL 2.x assist/organizeImports** | 1 523 | 210 | 382 | 59 | **−87%** | **−85%** |
+
+Real Biome 2.4.12 output is verbose — Rust/miette-style diagnostics with code frames, multi-line advices, `━` separators, and a trailing `check ━` footer. Wrun groups diagnostics by rule, shows severity tags, and compresses the run summary (`Checked N in Xms. Found X errors. Found Y warnings.`) into a single meta line. The summary reporter case (−94% tokens) is the biggest win — aggregated table of 6 rules becomes `exit:1 | biome | 9 errors, 6 warnings | 6 files | 2ms | reporter=summary`.
+
+**Why tokens matter more than bytes**: LLM context windows and billing are measured in tokens. A 9 KB pretty-reporter output with verbose code frames costs ~2 400 tokens raw but only ~235 after wrun — **90% token savings directly translates to 10× more tool output before hitting context limits**. Byte deltas are typically 1-5 percentage points larger than token deltas because BPE compresses repetitive noise (box-drawing chars, `━`, indentation) more aggressively than the actual content.
 
 **Observations**:
 - **Verbose output wins big** (60–99% reduction). This is the common AI-agent case: `docker ps`, `git log`, `ls -la`, `git diff`, `pytest` with failures, long build logs.
