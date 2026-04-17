@@ -342,6 +342,27 @@ Selected cases (bytes in → bytes out):
 | generic error-pattern extraction | 190 B | 205 B | +8% |
 | 10 KB minified-style long line | 10 008 B | 521 B | **−95%** |
 
+**Biome cases (synthetic + real Biome 2.4.12 output)**:
+
+| Case | Raw | Wrun | Δ |
+|---|---:|---:|---:|
+| biome pretty 3 errors (synthetic) | 1 104 B | 325 B | **−71%** |
+| biome warnings-only | 745 B | 245 B | **−68%** |
+| biome mixed err+warn+fixable | 1 089 B | 366 B | **−67%** |
+| biome format category | 760 B | 149 B | **−81%** |
+| biome many (15 diagnostics) | 2 906 B | 395 B | **−87%** |
+| biome summary reporter aggregated | 742 B | 55 B | **−93%** |
+| biome quiet mode | 1 089 B | 54 B | **−96%** |
+| **biome REAL 2.x pretty single-file** | 3 962 B | 552 B | **−87%** |
+| **biome REAL 2.x pretty multi-file (15 diags)** | 9 025 B | 813 B | **−91%** |
+| **biome REAL 2.x github reporter** | 2 356 B | 800 B | **−67%** |
+| **biome REAL 2.x summary reporter** | 1 881 B | 73 B | **−97%** |
+| **biome REAL 2.x JSON reporter** | 4 045 B | 806 B | **−81%** |
+| **biome REAL 2.x format-only** | 883 B | 126 B | **−86%** |
+| **biome REAL 2.x assist/organizeImports** | 1 523 B | 210 B | **−87%** |
+
+Real Biome 2.4.12 output is verbose — Rust/miette-style diagnostics with code frames, multi-line advices, `━` separators, and a trailing `check ━` footer. Wrun groups diagnostics by rule, shows `severity` tags, and compresses the run summary (`Checked N in Xms. Found X errors. Found Y warnings.`) into a single meta line. The summary reporter case (−97%) is the biggest win — aggregated table of 6 rules becomes `exit:1 | biome | 9 errors, 6 warnings | 6 files | 2ms | reporter=summary`.
+
 **Observations**:
 - **Verbose output wins big** (60–99% reduction). This is the common AI-agent case: `docker ps`, `git log`, `ls -la`, `git diff`, `pytest` with failures, long build logs.
 - **Already-compact output adds a canonical header** (`--porcelain`, `--oneline`, single-file grep, empty diff). The `exit:N | tool | summary` line is 20–70 extra bytes, but gives the agent a one-glance answer without reparsing.
