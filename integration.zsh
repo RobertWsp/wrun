@@ -40,6 +40,17 @@ function _wrun_active {
     [[ "$WRUN_AUTO" == "1" ]]
 }
 
+# For tools that emit line-oriented listings commonly consumed by pipelines
+# (xargs, head, awk, …), skip wrapping when stdout is not a TTY. Keeps
+# `ls -t *.log | head -1 | xargs cat` working like before wrun was sourced.
+# Set WRUN_FORCE_PIPE=1 to force wrapping even on pipelines (when you want
+# the optimized output programmatically).
+function _wrun_pipe_active {
+    _wrun_active || return 1
+    [[ "$WRUN_FORCE_PIPE" == "1" ]] && return 0
+    [[ -t 1 ]]
+}
+
 # ─── Direct tool wrappers ────────────────────────────────────────────────────
 # For tools called directly (not through uv/bun/npx)
 
@@ -166,7 +177,7 @@ tsc() {
 # Wraps: git status, git diff, git log, git add, git commit, git push, git pull
 
 git() {
-    if _wrun_active; then
+    if _wrun_pipe_active; then
         case "$1" in
             status|diff|log|show|add|commit|push|pull|fetch|rm|mv|checkout|switch|merge|rebase|stash)
                 command wrun git "$@"
@@ -181,7 +192,7 @@ git() {
 # Wraps: docker ps, docker images, docker logs
 
 docker() {
-    if _wrun_active; then
+    if _wrun_pipe_active; then
         case "$1" in
             ps|images|logs)
                 command wrun docker "$@"
@@ -207,21 +218,21 @@ kubectl() {
 # ─── grep/rg wrapper ─────────────────────────────────────────────────────────
 
 grep() {
-    if _wrun_active; then command wrun grep "$@"; else command grep "$@"; fi
+    if _wrun_pipe_active; then command wrun grep "$@"; else command grep "$@"; fi
 }
 
 rg() {
-    if _wrun_active; then command wrun rg "$@"; else command rg "$@"; fi
+    if _wrun_pipe_active; then command wrun rg "$@"; else command rg "$@"; fi
 }
 
 # ─── ls/tree wrapper ─────────────────────────────────────────────────────────
 
 ls() {
-    if _wrun_active; then command wrun ls "$@"; else command ls "$@"; fi
+    if _wrun_pipe_active; then command wrun ls "$@"; else command ls "$@"; fi
 }
 
 tree() {
-    if _wrun_active; then command wrun tree "$@"; else command tree "$@"; fi
+    if _wrun_pipe_active; then command wrun tree "$@"; else command tree "$@"; fi
 }
 
 # ─── Convenience aliases ────────────────────────────────────────────────────
