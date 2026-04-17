@@ -49,6 +49,29 @@ When `WRUN_AUTO=1`, these commands are transparently intercepted. Subcommands no
 
 Pass-through examples that stay out of wrun: `git rev-parse`, `git worktree list`, `docker run`, `docker exec`, `uv pip install`, `bun install`, `npx create-next-app`.
 
+### Pipeline-aware wrapping (TTY detection)
+
+Commands whose native output is line-oriented and commonly fed to pipelines (`xargs`, `head`, `awk`, `cut`) check `[[ -t 1 ]]` before wrapping. When stdout is **not a TTY**, they pass through to the real binary so downstream consumers see the raw output. This keeps shell one-liners working even with `WRUN_AUTO=1` exported globally:
+
+```bash
+# With WRUN_AUTO=1 — ls sees stdout is a pipe, skips wrun → raw file list
+ls -t ~/.local/share/wrun/*.log | head -1 | xargs cat
+
+# In terminal (stdout is TTY) — ls is wrapped → optimized output with noise hidden
+ls -la
+```
+
+Tools with TTY-aware wrapping: `ls`, `tree`, `grep`, `rg`, `git`, `docker`.
+
+Diagnostic tools keep unconditional wrapping (output is always structured, agents want it parsed even when captured): `pytest`, `vitest`, `jest`, `ruff`, `biome`, `tsc`, `mypy`, `make`, `cargo`, `kubectl`, `bun`, `npx`, `bunx`, `uv`.
+
+**Override**: set `WRUN_FORCE_PIPE=1` to wrap even in pipelines when you want the optimized summary programmatically:
+
+```bash
+WRUN_FORCE_PIPE=1 docker ps | grep "Up"   # get compact docker_ps rendering
+WRUN_FORCE_PIPE=1 git log --oneline -20 | head -5
+```
+
 ## Manual usage
 
 ```bash
