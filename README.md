@@ -347,6 +347,12 @@ The harness exercises and validates:
 | `git log --graph --oneline` | Graph prefix chars (`*|/\_`) stripped before hash match |
 | pytest all-passing one-liner | Duration captured despite trailing `=` |
 | Quiet mode with non-zero exit | One-line summary only (no details) |
+| Biome 2.x warning icon (`!` vs 1.x `⚠`) | Both accepted; severity inferred |
+| Biome 2.x info icon (`i` vs 1.x `ℹ`) | Both accepted for fix hints |
+| Biome 2.x GitHub key order (`title=` first) | Keys parsed in any order |
+| Biome 2.x JSON schema (ns duration, string path, line/column) | 2.x + 1.x schemas both supported |
+| Biome 2.x JSON preamble + `check ━` footer | Blob extracted from middle; footer ignored |
+| Biome summary reporter (`reporter/format ━`, `reporter/violations ━`) | Headers recognized; aggregate summary surfaced |
 
 ## Optimization techniques
 
