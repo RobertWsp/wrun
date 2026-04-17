@@ -319,58 +319,60 @@ Total: 81 | PASS: 83 | FAIL: 0
 
 The harness includes **8 cases using actual Biome 2.4.12 output** (`tests/corpus/biome_real_*.txt`) captured from `npm install @biomejs/biome@latest` runs against TypeScript fixtures covering: clean files, explicit any, unused vars, debugger, unused imports, format violations, assist/organizeImports, and all 4 reporters (pretty, summary, github, json).
 
-Selected cases (bytes in → bytes out):
-
-| Case | Raw | Wrun | Δ |
-|---|---:|---:|---:|
-| `docker ps` (33 containers, live) | 11 792 B | 1 351 B | **−89%** |
-| pytest 3-failure fixture | 2 462 B | 310 B | **−88%** |
-| pytest 3-failure + `--quiet` | 2 462 B | 45 B | **−99%** |
-| pytest 3-failure + `--max-failures=1` | 2 462 B | 155 B | **−94%** |
-| pytest `--json` | 2 462 B | 563 B | **−78%** |
-| vitest 2-failure fixture | 1 291 B | 538 B | **−59%** |
-| tsc 4 errors / 3 files | 516 B | 273 B | **−48%** |
-| ruff classic 6 errors | 359 B | 255 B | **−29%** |
-| ruff modern Rust-style | 392 B | 156 B | **−61%** |
-| ls -la with noise dirs | 268 B | 82 B | **−70%** |
-| tree with deep noise subtrees | 194 B | 123 B | **−37%** |
-| git diff (2-file fixture) | 274 B | 70 B | **−75%** |
-| git log (graph fixture) | 93 B | 109 B | +17% |
-| git status porcelain (already compact) | 34 B | 89 B | +161% |
-| grep multi-file (few matches) | 65 B | 107 B | +64% |
-| `grep -Hn` self-source (real) | 4 247 B | 658 B | **−85%** |
-| generic error-pattern extraction | 190 B | 205 B | +8% |
-| 10 KB minified-style long line | 10 008 B | 521 B | **−95%** |
-
-**Biome cases (synthetic + real Biome 2.4.12 output) — bytes AND tokens**:
-
-Tokens measured with [tiktoken](https://github.com/openai/tiktoken) using the `cl100k_base` encoding (GPT-4's BPE — a widely-used proxy for modern LLM token accounting, including Claude and Gemini which use similar BPE granularity). Run the report yourself with:
+Token counts measured with [tiktoken](https://github.com/openai/tiktoken) using the `cl100k_base` encoding (GPT-4 BPE — the de-facto proxy for modern LLM token accounting; Claude and Gemini use similar BPE granularity, so per-case deltas are robust across providers). Reproduce with:
 
 ```bash
 pip install --user tiktoken
 python3 tests/token_report.py
 ```
 
-| Case | Raw B | Wrun B | Raw tok | Wrun tok | Δ bytes | Δ tokens |
+| Tool · case | Raw B | Wrun B | Raw tok | Wrun tok | Δ bytes | Δ tokens |
 |---|---:|---:|---:|---:|---:|---:|
-| biome pretty 3 errors (synthetic) | 1 104 | 325 | 278 | 95 | **−71%** | **−66%** |
-| biome warnings-only | 745 | 245 | 190 | 72 | **−68%** | **−62%** |
-| biome mixed err+warn+fixable | 1 089 | 366 | 262 | 108 | **−67%** | **−59%** |
-| biome format category | 760 | 149 | 185 | 46 | **−81%** | **−75%** |
-| biome many (15 diagnostics) | 2 906 | 395 | 678 | 134 | **−87%** | **−80%** |
-| biome summary reporter aggregated | 742 | 55 | 159 | 22 | **−93%** | **−86%** |
-| biome quiet mode | 1 089 | 54 | 262 | 22 | **−96%** | **−92%** |
-| **biome REAL 2.x pretty single-file** | 3 962 | 552 | 1 083 | 155 | **−86%** | **−86%** |
-| **biome REAL 2.x pretty multi-file (15 diags)** | 9 025 | 813 | 2 423 | 235 | **−91%** | **−90%** |
-| **biome REAL 2.x github reporter** | 2 356 | 800 | 601 | 232 | **−67%** | **−61%** |
-| **biome REAL 2.x summary reporter** | 1 881 | 73 | 409 | 26 | **−97%** | **−94%** |
-| **biome REAL 2.x JSON reporter** | 4 045 | 806 | 1 015 | 231 | **−81%** | **−77%** |
-| **biome REAL 2.x format-only** | 883 | 126 | 198 | 38 | **−86%** | **−81%** |
-| **biome REAL 2.x assist/organizeImports** | 1 523 | 210 | 382 | 59 | **−87%** | **−85%** |
+| pytest 3 failures (corpus) | 2 462 | 310 | 491 | 85 | **−87%** | **−83%** |
+| pytest 3 failures + `--quiet` | 2 462 | 45 | 491 | 20 | **−98%** | **−96%** |
+| pytest 3 failures + `--max-failures=1` | 2 462 | 155 | 491 | 49 | **−94%** | **−90%** |
+| pytest `--json` | 2 462 | 563 | 491 | 155 | **−77%** | **−68%** |
+| pytest all-passing synthetic | 278 | 36 | 54 | 16 | **−87%** | **−70%** |
+| vitest 2 failures | 1 291 | 538 | 700 | 156 | **−58%** | **−77%** |
+| tsc 4 errors / 3 files | 516 | 273 | 160 | 96 | **−47%** | **−40%** |
+| ruff classic 6 errors | 359 | 255 | 130 | 97 | **−29%** | **−25%** |
+| ruff modern (Rust-style) | 392 | 156 | 131 | 59 | **−60%** | **−55%** |
+| biome pretty 3 errors (synthetic) | 1 104 | 325 | 278 | 95 | **−70%** | **−65%** |
+| biome warnings-only (synthetic) | 745 | 245 | 190 | 72 | **−67%** | **−62%** |
+| biome mixed err+warn+fixable | 1 089 | 366 | 262 | 108 | **−66%** | **−58%** |
+| biome format category | 760 | 149 | 185 | 46 | **−80%** | **−75%** |
+| biome many (15 diagnostics) | 2 906 | 395 | 678 | 134 | **−86%** | **−80%** |
+| biome summary reporter (aggregated) | 742 | 55 | 159 | 22 | **−92%** | **−86%** |
+| biome quiet mode | 1 089 | 54 | 262 | 22 | **−95%** | **−91%** |
+| **biome REAL 2.4.12 · pretty single-file** | 3 962 | 552 | 1 083 | 155 | **−86%** | **−85%** |
+| **biome REAL 2.4.12 · pretty multi-file (15 diags)** | 9 025 | 813 | 2 423 | 235 | **−91%** | **−90%** |
+| **biome REAL 2.4.12 · github reporter** | 2 356 | 800 | 601 | 232 | **−66%** | **−61%** |
+| **biome REAL 2.4.12 · summary reporter** | 1 881 | 73 | 409 | 26 | **−96%** | **−93%** |
+| **biome REAL 2.4.12 · JSON reporter** | 4 045 | 806 | 1 015 | 231 | **−80%** | **−77%** |
+| **biome REAL 2.4.12 · format-only** | 883 | 126 | 198 | 38 | **−85%** | **−80%** |
+| **biome REAL 2.4.12 · assist/organizeImports** | 1 523 | 210 | 382 | 59 | **−86%** | **−84%** |
+| docker_ps 2 containers (stdin) | 359 | 117 | 119 | 44 | **−67%** | **−63%** |
+| docker_ps Paused+Removing states | 375 | 165 | 95 | 58 | **−56%** | **−38%** |
+| `grep -Hn` self-source (real, ~4 KB) | 4 247 | 658 | ~1 040 | ~210 | **−84%** | **−79%** |
+| `ls -la` with noise dirs | 268 | 82 | 148 | 33 | **−69%** | **−77%** |
+| `tree -L 2` with deep noise | 194 | 123 | 62 | 41 | **−36%** | **−33%** |
+| git diff (2-file fixture) | 274 | 70 | 114 | 34 | **−74%** | **−70%** |
+| git diff `--name-only` (4 files) | 138 | 174 | 33 | 48 | +26% | +45% |
+| git log graph fixture | 93 | 109 | 34 | 36 | +17% | +5% |
+| git_status porcelain (already compact) | 34 | 89 | 15 | 35 | +161% | +133% |
+| grep multi-file (few matches) | 65 | 107 | 28 | 48 | +64% | +71% |
+| edge: 10 KB minified-style long line | 10 008 | 518 | 1 255 | 72 | **−94%** | **−94%** |
+| edge: OSC 8 hyperlinks (ruff modern) | 134 | 76 | 52 | 31 | **−43%** | **−40%** |
+| edge: heavy ANSI codes | 35 | 35 | 18 | 11 | +0% | **−38%** |
+| edge: empty input (stdin) | 0 | 17 | 0 | 6 | - | - |
+| generic error-pattern extraction | 190 | 205 | 44 | 53 | +7% | +20% |
 
-Real Biome 2.4.12 output is verbose — Rust/miette-style diagnostics with code frames, multi-line advices, `━` separators, and a trailing `check ━` footer. Wrun groups diagnostics by rule, shows severity tags, and compresses the run summary (`Checked N in Xms. Found X errors. Found Y warnings.`) into a single meta line. The summary reporter case (−94% tokens) is the biggest win — aggregated table of 6 rules becomes `exit:1 | biome | 9 errors, 6 warnings | 6 files | 2ms | reporter=summary`.
+**Reading the table**:
+- Bold negative deltas = wrun wins. **Verbose + structured output** (pytest failures, biome pretty, docker lists, `grep -Hn`, 10 KB lines) dominates this region with 60–97% reductions.
+- Already-compact payloads (`git log --oneline`, `git status --porcelain`, small greps) show positive deltas because the `exit:N | tool | summary` meta line costs 20–70 bytes / 10–35 tokens. This is a *deliberate* trade-off: the canonical header gives the agent a zero-parse answer (`3 modified, 1 untracked` vs reparsing 5 porcelain codes).
+- Byte and token deltas usually agree within ±5 percentage points. Tokens can drop faster than bytes when the raw output has BPE-inefficient content — ANSI escapes (`\x1b[31m`), box-drawing (`━`), repeated indentation — which collapse heavily under GPT-4 BPE. Tokens can also drop *slower* than bytes when wrun replaces raw bytes with high-signal but BPE-expensive identifiers (e.g. `lint/correctness/noUnusedVariables`).
 
-**Why tokens matter more than bytes**: LLM context windows and billing are measured in tokens. A 9 KB pretty-reporter output with verbose code frames costs ~2 400 tokens raw but only ~235 after wrun — **90% token savings directly translates to 10× more tool output before hitting context limits**. Byte deltas are typically 1-5 percentage points larger than token deltas because BPE compresses repetitive noise (box-drawing chars, `━`, indentation) more aggressively than the actual content.
+**Why tokens matter more than bytes**: LLM context windows and billing are measured in tokens, not bytes. A 9 KB Biome pretty-reporter output costs ~2 423 tokens raw but only ~235 after wrun — a **90% token saving**, which means 10× more tool output fits before hitting context limits. For agents running dozens of tool calls per session this compounds into whole extra turns of productive work.
 
 **Observations**:
 - **Verbose output wins big** (60–99% reduction). This is the common AI-agent case: `docker ps`, `git log`, `ls -la`, `git diff`, `pytest` with failures, long build logs.
