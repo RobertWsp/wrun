@@ -357,7 +357,7 @@ python3 tests/token_report.py
 | `ls -la` with noise dirs | 268 | 82 | 148 | 33 | **−69%** | **−77%** |
 | `tree -L 2` with deep noise | 194 | 123 | 62 | 41 | **−36%** | **−33%** |
 | git diff (2-file fixture) | 274 | 70 | 114 | 34 | **−74%** | **−70%** |
-| git diff `--name-only` (4 files) | 138 | 174 | 33 | 48 | +26% | +45% |
+| git diff `--name-only` (4 files) | 138 | 144 | 33 | 36 | +4% | +9% |
 | git log graph fixture | 93 | 109 | 34 | 36 | +17% | +5% |
 | git_status porcelain (already compact) | 34 | 89 | 15 | 35 | +161% | +133% |
 | grep multi-file (few matches) | 65 | 107 | 28 | 48 | +64% | +71% |
@@ -382,12 +382,24 @@ Six cases in the table show **positive deltas** — wrun output is larger than r
 |---|---:|---|---|---|
 | `git_status` porcelain (`M/?? /A`) | **+20** | `exit:0 \| git_status \| 1 modified, 1 added, 1 untracked` (~20 tok) | Zero-parse rollup — agent reads "1 modified, 1 added, 1 untracked" instead of mentally reducing 3 porcelain codes | ✅ Tradeoff — value grows with entry count; a 30-file porcelain status still wins big |
 | `grep` multi-file (few matches) | **+20** | Meta line + per-file `./file.py (N):` headers | Grouping by file + count. With 3 matches overhead is significant; with 50+ matches the grouping is essential | ✅ Tradeoff — same structure scales to 1000+ matches |
-| `git diff --name-only` (4 paths) | **+15** | Meta + `M ` prefix on each path | Canonical `git_diff` shape lets the agent compare `--name-only` / `--name-status` / `--numstat` outputs interchangeably | ⚠️ Marginal — `M ` prefix is redundant when there's no status info; potential micro-optimization |
+| `git diff --name-only` (4 paths) | **+3** | Single `exit:0\n` line prefix | Zero-byte transformation; agent still gets the canonical exit code signal | ✅ Heavily optimized across 2 passes: +15 tok → +10 tok (dropped `M ` prefix) → +3 tok (adaptive passthrough skips meta line when raw already fits the shape) |
 | `generic` error-pattern extraction | **+9** | `exit:N \| generic` meta line | Tells agent: parser didn't recognize the tool, used error-pattern heuristic | ✅ Small cost, informative |
 | `git log` graph fixture | **+2** | Meta line; offset by removal of graph chars (`* `, `\|\\`, `\| *`) | Near break-even. BPE-expensive graph glyphs collapse cleanly into oneline format | ✅ Effectively neutral |
 | `edge` empty input | **+6** | `exit:0 \| generic` for an empty stdin | Agent distinguishes "command ran, no output" from "command never executed / pipe broken" | ✅ Diagnostic signal from null-value input |
 
 **Pattern**: positive deltas cluster around **already-compact inputs** (≤ 200 bytes raw). The fixed cost of the `exit:N | tool | summary` header is ~10-20 tokens, which is ≤ 3 % of a verbose output but ≥ 30 % of a 3-line raw payload. For scale-varying tools (`git_status`, `grep`, `ls`) the same emitted structure that looks expensive on tiny inputs dominates the savings on real-world inputs — a production `git status` with 50 entries, or a `grep -rn` across 200 files, reaches the same ~−90 % territory as Biome's pretty reporter.
+
+### Adaptive passthrough (surgical)
+
+For cases where the parser performs **no semantic transformation** on the input — e.g. `git diff --name-only` emits a bare path list that agents consume as-is — wrun detects the pattern and skips the meta line entirely, emitting `exit:N\n<raw>` instead of `exit:N | git_diff | N files\n<paths>`. This drops the 4-path fixture from +30 % tokens (with meta) to +9 % tokens (passthrough) — the residual 3-token overhead is the `exit:0\n` signal agents parse.
+
+Passthrough is deliberately **not** applied to tools whose parser adds value — `grep` (file grouping), `git_status` (rollup), `git_log` (graph strip), `git_diff --name-status` (R100 → R normalization), `git_diff --numstat` (+N -M formatting), any lint/test tool (exit code + failure counts). In those cases the meta line's structured summary *is* the optimization, not overhead.
+
+Guards (all must hold for passthrough to engage):
+- `result.extra.get("git_diff_inferred_status") is True` — parser confirmed raw is pure path list
+- `exit_code == 0` — non-zero exits keep structured output (agent needs failure context)
+- No `--json` / `--quiet` / `--full` flag
+- Raw input ≤ 200 bytes and meta version would be larger (≥ 8 byte overhead)
 
 **Not on the table but worth noting**: `heavy ANSI codes` edge case is **bytes +0 % but tokens −38 %**. Raw `\x1b[31mERROR\x1b[0m` is BPE-expensive (each escape code tokenizes into 3-4 sub-tokens); wrun strips ANSI and keeps the plain text, bytes stay roughly flat but tokens drop sharply. This is why token measurement matters — byte-only accounting underestimates the real agent-context savings on colorful CLI tools.
 

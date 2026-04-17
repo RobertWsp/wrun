@@ -640,12 +640,13 @@ index 0000000..0000003
         ),
         tool_hint="git_diff",
         expect_contains=[
-            "git_diff",
-            "4 files",
-            "M api/app/api/routes/admin.py",
-            "M front/src/pages/admin/DashboardPage.tsx",
+            "exit:0",
+            "api/app/api/routes/admin.py",
+            "api/app/repositories/roles.py",
+            "api/tests/test_admin_dashboard_stats.py",
+            "front/src/pages/admin/DashboardPage.tsx",
         ],
-        expect_not_contains=["no changes"],
+        expect_not_contains=["no changes", "M api/app", "M front/", "4 files"],
     ),
     Case(
         name="git_diff: --name-status (status+path tab-separated)",

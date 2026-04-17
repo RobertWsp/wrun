@@ -1372,6 +1372,12 @@ class GitDiffParser(Parser):
                 total_add = sum(a for _, _, a, _ in alt_files)
                 total_del = sum(d for _, _, _, d in alt_files)
                 result.extra["git_diff_totals"] = (len(alt_files), total_add, total_del)
+                # --name-only input is a pure path list; all statuses default to "M"
+                # with zero add/del. Skip the "M " prefix in the formatter to save tokens.
+                if total_add == 0 and total_del == 0 and all(
+                    s == "M" for _, s, _, _ in alt_files
+                ):
+                    result.extra["git_diff_inferred_status"] = True
             else:
                 result.extra["git_diff_totals"] = (0, 0, 0)
 
@@ -2059,12 +2065,16 @@ def _format_git_diff(result: Result, config: Config) -> str:
 
     files = result.extra.get("git_diff_files", [])
     stat_rows = result.extra.get("git_diff_stat_rows", [])
+    inferred = result.extra.get("git_diff_inferred_status", False)
 
     if files:
         shown = files[: config.max_failures * 2]
         for path, status, add, rem in shown:
             if add or rem:
                 parts.append(f"{status} {path} +{add} -{rem}")
+            elif inferred:
+                # --name-only: emit bare path, no phantom "M " prefix
+                parts.append(path)
             else:
                 parts.append(f"{status} {path}")
         remaining = len(files) - len(shown)
@@ -2432,8 +2442,43 @@ def _format_biome(result: Result, config: Config) -> str:
     return "\n".join(parts)
 
 
+def _maybe_passthrough_tiny(result: Result, config: Config, raw_output: str, formatted: str) -> Optional[str]:
+    """Return raw output (prefixed with `exit:N`) for tiny payloads where wrun's
+    meta line costs more tokens than the parser saves.
+
+    Engaged surgically: only where the parser performs no semantic transformation.
+    Currently applies to `git_diff --name-only` (pure path list — parser just dropped
+    the phantom `M ` prefix after the inferred-status optimization). Lint/test tools,
+    grep (file grouping), git_status (rollup), git_log (graph strip), git_diff with
+    real diffs/numstat/name-status (status normalization) all keep their structured
+    summary because the transformation itself is the value proposition.
+    """
+    if config.quiet or config.json_output or config.full:
+        return None
+    if result.exit_code != 0:
+        return None
+    raw_stripped = raw_output.rstrip()
+    if not raw_stripped:
+        return None
+    raw_bytes = len(raw_stripped.encode("utf-8"))
+    if raw_bytes > 200:
+        return None
+    if len(formatted.encode("utf-8")) <= raw_bytes + 8:
+        return None
+    # git_diff --name-only: pure path list, parser adds no value → passthrough wins
+    if result.tool == "git_diff" and result.extra.get("git_diff_inferred_status"):
+        return f"exit:{result.exit_code}\n{raw_stripped}"
+    return None
+
+
 def format_result(result: Result, config: Config, raw_output: str) -> str:
     """Format the parsed result into maximum token-efficient output for LLM."""
+    formatted = _format_result_impl(result, config, raw_output)
+    passthrough = _maybe_passthrough_tiny(result, config, raw_output, formatted)
+    return passthrough if passthrough is not None else formatted
+
+
+def _format_result_impl(result: Result, config: Config, raw_output: str) -> str:
     # Dispatch to specialized formatters for non-test tools
     if result.tool == "git_status":
         return _format_git_status(result, config)
