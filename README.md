@@ -374,6 +374,25 @@ python3 tests/token_report.py
 
 **Why tokens matter more than bytes**: LLM context windows and billing are measured in tokens, not bytes. A 9 KB Biome pretty-reporter output costs ~2 423 tokens raw but only ~235 after wrun — a **90% token saving**, which means 10× more tool output fits before hitting context limits. For agents running dozens of tool calls per session this compounds into whole extra turns of productive work.
 
+### Analysis of positive-delta cases (where wrun adds tokens)
+
+Six cases in the table show **positive deltas** — wrun output is larger than raw. These are deliberate tradeoffs, not regressions. Each row below breaks down what was added and whether it earns its cost:
+
+| Case | Δ tok | Tokens added | Value added | Verdict |
+|---|---:|---|---|---|
+| `git_status` porcelain (`M/?? /A`) | **+20** | `exit:0 \| git_status \| 1 modified, 1 added, 1 untracked` (~20 tok) | Zero-parse rollup — agent reads "1 modified, 1 added, 1 untracked" instead of mentally reducing 3 porcelain codes | ✅ Tradeoff — value grows with entry count; a 30-file porcelain status still wins big |
+| `grep` multi-file (few matches) | **+20** | Meta line + per-file `./file.py (N):` headers | Grouping by file + count. With 3 matches overhead is significant; with 50+ matches the grouping is essential | ✅ Tradeoff — same structure scales to 1000+ matches |
+| `git diff --name-only` (4 paths) | **+15** | Meta + `M ` prefix on each path | Canonical `git_diff` shape lets the agent compare `--name-only` / `--name-status` / `--numstat` outputs interchangeably | ⚠️ Marginal — `M ` prefix is redundant when there's no status info; potential micro-optimization |
+| `generic` error-pattern extraction | **+9** | `exit:N \| generic` meta line | Tells agent: parser didn't recognize the tool, used error-pattern heuristic | ✅ Small cost, informative |
+| `git log` graph fixture | **+2** | Meta line; offset by removal of graph chars (`* `, `\|\\`, `\| *`) | Near break-even. BPE-expensive graph glyphs collapse cleanly into oneline format | ✅ Effectively neutral |
+| `edge` empty input | **+6** | `exit:0 \| generic` for an empty stdin | Agent distinguishes "command ran, no output" from "command never executed / pipe broken" | ✅ Diagnostic signal from null-value input |
+
+**Pattern**: positive deltas cluster around **already-compact inputs** (≤ 200 bytes raw). The fixed cost of the `exit:N | tool | summary` header is ~10-20 tokens, which is ≤ 3 % of a verbose output but ≥ 30 % of a 3-line raw payload. For scale-varying tools (`git_status`, `grep`, `ls`) the same emitted structure that looks expensive on tiny inputs dominates the savings on real-world inputs — a production `git status` with 50 entries, or a `grep -rn` across 200 files, reaches the same ~−90 % territory as Biome's pretty reporter.
+
+**Not on the table but worth noting**: `heavy ANSI codes` edge case is **bytes +0 % but tokens −38 %**. Raw `\x1b[31mERROR\x1b[0m` is BPE-expensive (each escape code tokenizes into 3-4 sub-tokens); wrun strips ANSI and keeps the plain text, bytes stay roughly flat but tokens drop sharply. This is why token measurement matters — byte-only accounting underestimates the real agent-context savings on colorful CLI tools.
+
+**Possible micro-optimization (not yet implemented)**: when `git diff --name-only` detects no status info was provided (pure path list), drop the `M ` prefix to save ~4 tokens on that case. Would need a flag on `Result.extra` to distinguish "inferred status" from "real status". Queued for evaluation.
+
 **Observations**:
 - **Verbose output wins big** (60–99% reduction). This is the common AI-agent case: `docker ps`, `git log`, `ls -la`, `git diff`, `pytest` with failures, long build logs.
 - **Already-compact output adds a canonical header** (`--porcelain`, `--oneline`, single-file grep, empty diff). The `exit:N | tool | summary` line is 20–70 extra bytes, but gives the agent a one-glance answer without reparsing.
