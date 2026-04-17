@@ -950,6 +950,15 @@ class GitDiffParser(Parser):
         r"(?:,\s+(\d+)\s+insertions?\(\+\))?"
         r"(?:,\s+(\d+)\s+deletions?\(-\))?"
     )
+    # Fallback formats when full-diff markers are absent
+    NAMESTATUS_RE = re.compile(r"^([MADRCTU])(\d*)\t(.+)$")
+    NUMSTAT_RE = re.compile(r"^(\d+|-)\t(\d+|-)\t(.+)$")
+    NAMEONLY_SKIP_PREFIXES = (
+        ":", "+", "-", "@", " ", "\t", "\\",
+        "index ", "diff ", "new file", "deleted ",
+        "rename ", "copy ", "similarity ", "dissimilarity ",
+        "mode ", "Binary ",
+    )
 
     def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
         result = Result(tool="git_diff", exit_code=0, duration=0)
@@ -1010,10 +1019,58 @@ class GitDiffParser(Parser):
             result.extra["git_diff_stat_rows"] = stat_rows
             result.extra["git_diff_totals"] = (summary_files or len(stat_rows), summary_add, summary_del)
         else:
-            result.extra["git_diff_totals"] = (0, 0, 0)
+            alt_files = self._parse_name_formats(lines)
+            if alt_files:
+                if git_root:
+                    alt_files = [(relativize_path(p, git_root), s, a, d) for p, s, a, d in alt_files]
+                result.extra["git_diff_files"] = alt_files
+                total_add = sum(a for _, _, a, _ in alt_files)
+                total_del = sum(d for _, _, _, d in alt_files)
+                result.extra["git_diff_totals"] = (len(alt_files), total_add, total_del)
+            else:
+                result.extra["git_diff_totals"] = (0, 0, 0)
 
         result.total = result.extra["git_diff_totals"][0]
         return result
+
+    def _parse_name_formats(self, lines: list[str]) -> list[tuple[str, str, int, int]]:
+        """Handle --name-only / --name-status / --numstat output.
+
+        Called only when full-diff and --stat parsing found no files.
+        Returns list of (path, status, additions, deletions).
+        """
+        out: list[tuple[str, str, int, int]] = []
+        for raw in lines:
+            line = raw.rstrip("\r")
+            if not line.strip():
+                continue
+
+            # --numstat: "ADD\tDEL\tpath"  (binary: "-\t-\t")
+            m = self.NUMSTAT_RE.match(line)
+            if m:
+                add = 0 if m.group(1) == "-" else int(m.group(1))
+                dele = 0 if m.group(2) == "-" else int(m.group(2))
+                out.append((m.group(3), "M", add, dele))
+                continue
+
+            # --name-status: "M\tpath" or "R100\told\tnew"
+            m = self.NAMESTATUS_RE.match(line)
+            if m:
+                status = m.group(1)
+                rest = m.group(3)
+                if status in ("R", "C") and "\t" in rest:
+                    _, new_path = rest.split("\t", 1)
+                    out.append((new_path, status, 0, 0))
+                else:
+                    out.append((rest, status, 0, 0))
+                continue
+
+            # --name-only: plain path, no tabs, no diff-header chars
+            if "\t" in line or line.startswith(self.NAMEONLY_SKIP_PREFIXES):
+                continue
+            out.append((line, "M", 0, 0))
+
+        return out
 
 
 class GitLogParser(Parser):
@@ -1503,7 +1560,10 @@ def _format_git_diff(result: Result, config: Config) -> str:
     if files:
         shown = files[: config.max_failures * 2]
         for path, status, add, rem in shown:
-            parts.append(f"{status} {path} +{add} -{rem}")
+            if add or rem:
+                parts.append(f"{status} {path} +{add} -{rem}")
+            else:
+                parts.append(f"{status} {path}")
         remaining = len(files) - len(shown)
         if remaining > 0:
             parts.append(f"+{remaining} more files")

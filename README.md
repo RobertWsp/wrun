@@ -89,7 +89,7 @@ pytest tests/ 2>&1 | wrun --stdin --tool pytest   # pipe mode
 | Tool | Parser | Output shape |
 |---|---|---|
 | **git status** | `GitStatusParser` | porcelain codes (`M`/`A`/`D`/`R`/`??`) + branch + count rollup |
-| **git diff** | `GitDiffParser` | per-file `status path +N -M`, no hunk bodies |
+| **git diff** | `GitDiffParser` | per-file `status path +N -M`; handles default / `--stat` / `--name-only` / `--name-status` / `--numstat` |
 | **git log / show** | `GitLogParser` | `hash subject` one per line, handles `--graph`/`--oneline` |
 | **git add/commit/push/pull/…** | `GitWriteParser` | 1-line summary (commit SHA, refspec update, etc.) |
 | **docker ps / images** | `DockerPsParser` | ID, name, image, status, compact ports (IPv4+IPv6 dedup) |
@@ -135,13 +135,27 @@ R  src/a.py -> src/renamed.py
 
 ### git diff HEAD
 
-Raw: 25 lines / 513 B → wrun: 5 lines / 113 B (**78% reduction**)
+Raw: 25 lines / 513 B → wrun: 5 lines / 107 B (**79% reduction**)
 ```
 exit:0 | git_diff | 4 files | +2 -2
 A src/added.py +1 -0
 M src/b.py +1 -1
 D src/c.py +0 -1
-M src/renamed.py +0 -0
+M src/renamed.py
+```
+
+### git diff --name-only origin/master...HEAD
+
+`--name-only`, `--name-status`, and `--numstat` are the fastest diff shapes AI agents reach for. They all get parsed into the same canonical table — no more silent "no changes" when the raw output was a list of 10+ bare paths.
+
+```
+exit:0 | git_diff | 10 files
+M api/app/api/routes/admin.py
+M api/app/repositories/users.py
+M api/tests/test_admin_dashboard_stats.py
+A front/src/stores/__tests__/admin-dashboard-stats.test.ts
+M front/src/pages/admin/DashboardPage.tsx
+…
 ```
 
 ### git log
@@ -224,7 +238,7 @@ E501 x1: Line too long [src/util.py:88]
 3 fixable with --fix
 ```
 
-## Measured reduction — 31-case harness
+## Measured reduction — 35-case harness
 
 `tests/harness.py` runs every parser against synthetic + real commands and asserts structural expectations (field presence, counts, line numbers, flags). Run it with:
 
@@ -235,8 +249,8 @@ python3 tests/harness.py
 Current result:
 
 ```
-Total: 31 | PASS: 31 | FAIL: 0
-Aggregated: 28 935 B → 4 858 B  (−84%)
+Total: 35 | PASS: 35 | FAIL: 0
+Aggregated: 29 373 B → 5 313 B  (−82%)
 ```
 
 Selected cases (bytes in → bytes out):

@@ -312,6 +312,65 @@ index 0000000..0000003
         expect_contains=["git_diff", "2 files", "+3 -1", "A src/b.py", "M src/a.py"],
     ),
     Case(
+        name="git_diff: --name-only (bare paths, most common AI workflow)",
+        input_text=(
+            "api/app/api/routes/admin.py\n"
+            "api/app/repositories/roles.py\n"
+            "api/tests/test_admin_dashboard_stats.py\n"
+            "front/src/pages/admin/DashboardPage.tsx\n"
+        ),
+        tool_hint="git_diff",
+        expect_contains=[
+            "git_diff",
+            "4 files",
+            "M api/app/api/routes/admin.py",
+            "M front/src/pages/admin/DashboardPage.tsx",
+        ],
+        expect_not_contains=["no changes"],
+    ),
+    Case(
+        name="git_diff: --name-status (status+path tab-separated)",
+        input_text=(
+            "M\tsrc/api/client.ts\n"
+            "A\tsrc/new_feature.py\n"
+            "D\tsrc/removed.py\n"
+            "R100\tsrc/old.py\tsrc/renamed.py\n"
+        ),
+        tool_hint="git_diff",
+        expect_contains=[
+            "git_diff",
+            "4 files",
+            "M src/api/client.ts",
+            "A src/new_feature.py",
+            "D src/removed.py",
+            "R src/renamed.py",
+        ],
+        expect_not_contains=["no changes", "src/old.py"],
+    ),
+    Case(
+        name="git_diff: --numstat (add/del/path tab-separated + binary marker)",
+        input_text=(
+            "5\t3\tsrc/api/client.ts\n0\t10\tsrc/removed.py\n-\t-\tdocs/logo.png\n"
+        ),
+        tool_hint="git_diff",
+        expect_contains=[
+            "git_diff",
+            "3 files",
+            "+5 -13",
+            "src/api/client.ts +5 -3",
+            "src/removed.py +0 -10",
+            "docs/logo.png",
+        ],
+        expect_not_contains=["no changes"],
+    ),
+    Case(
+        name="git_diff: empty output stays 'no changes' (clean worktree)",
+        input_text="",
+        tool_hint="git_diff",
+        expect_contains=["git_diff", "no changes"],
+        expect_not_contains=["1 files", "M "],
+    ),
+    Case(
         name="git_log: graph format via stdin",
         input_text="""* abc1234 feat: add feature
 * def5678 fix: bug
