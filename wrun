@@ -20,6 +20,7 @@ Options:
     --no-save           Don't save full output to disk
     --stdin             Read from stdin instead of executing command
     --tool TOOL         Hint tool type when using --stdin
+    --no-compact        Disable ultra-compact mode (use verbose format)
     -h, --help          Show this help
 
 Examples:
@@ -55,6 +56,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import Counter
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -116,6 +118,7 @@ class Config:
     no_save: bool = False
     stdin_mode: bool = False
     tool_hint: str = ""
+    compact: bool = True
 
 
 @dataclass
@@ -268,6 +271,27 @@ def remove_empty_and_decorative(lines: list[str]) -> list[str]:
     return result
 
 
+def _dedup_lines(lines: list[str], min_count: int = 3) -> list[str]:
+    """Collapse consecutive identical lines into 'line xN' format."""
+    if not lines:
+        return lines
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        key = " ".join(line.split())
+        j = i + 1
+        while j < len(lines) and " ".join(lines[j].split()) == key:
+            j += 1
+        count = j - i
+        if count >= min_count and key:
+            result.append(f"{line.rstrip()} x{count}")
+        else:
+            result.extend(lines[i:j])
+        i = j
+    return result
+
+
 # ─── Tool Detection ──────────────────────────────────────────────────────────
 
 TOOL_MAP = [
@@ -388,6 +412,20 @@ def detect_tool(cmd_parts: list[str]) -> str:
         for pattern in patterns:
             if pattern in cmd_str:
                 return tool
+
+    # Package installers
+    if cmd0 in ("npm", "pnpm", "yarn", "bun") and len(cmd_parts) > 1:
+        if cmd_parts[1].lower() in ("install", "i", "ci", "add", "update", "upgrade"):
+            return "install"
+    if cmd0 in ("pip", "pip3") and len(cmd_parts) > 1 and cmd_parts[1].lower() == "install":
+        return "install"
+    if cmd0 == "uv" and len(cmd_parts) > 2 and cmd_parts[1].lower() == "pip" and cmd_parts[2].lower() == "install":
+        return "install"
+    if cmd0 == "uv" and len(cmd_parts) > 1 and cmd_parts[1].lower() in ("add", "sync"):
+        return "install"
+    if cmd0 == "bundle" and len(cmd_parts) > 1 and cmd_parts[1].lower() == "install":
+        return "install"
+
     return "generic"
 
 
@@ -1608,17 +1646,22 @@ class DockerLogsParser(Parser):
 
         stripped: list[str] = []
         for line in lines:
-            stripped.append(self.TIMESTAMP_RE.sub("", line, count=1))
+            stripped.append(self.TIMESTAMP_RE.sub("", line, count=1).strip())
 
-        error_lines: list[str] = []
+        # Counter-based dedup: collapse repeated error lines
+        error_counter: Counter = Counter()
         for line in stripped:
             if self.ERROR_RE.search(line):
-                error_lines.append(line)
-                if len(error_lines) >= 5:
-                    break
+                key = " ".join(line.split())
+                error_counter[key] += 1
 
+        error_lines: list[str] = []
+        for msg, count in error_counter.most_common(5):
+            error_lines.append(f"{msg} x{count}" if count > 1 else msg)
+
+        tail_raw = stripped[-30:] if len(stripped) > 30 else stripped
         result.extra["docker_logs_errors"] = error_lines
-        result.extra["docker_logs_tail"] = stripped[-30:] if len(stripped) > 30 else stripped
+        result.extra["docker_logs_tail"] = _dedup_lines(tail_raw)
         result.extra["docker_logs_total"] = len(lines)
         return result
 
@@ -1716,6 +1759,7 @@ class KubectlParser(Parser):
             mode = "apply"
         else:
             mode = "logs"
+            lines = _dedup_lines(lines)
 
         result.extra["kubectl_mode"] = mode
         result.extra["kubectl_lines"] = lines
@@ -1925,6 +1969,10 @@ class GenericParser(Parser):
     def _build_summary(lines: list[str], total: int) -> list[str]:
         if total <= 15:
             return lines
+        sample = " ".join(lines[:10]).lower()
+        is_install = any(w in sample for w in ("downloading", "collecting", "using ", "fetching", "installing"))
+        if is_install and total > 50:
+            return lines[:3] + [f"... ({total - 4} lines hidden)"] + lines[-1:]
         return lines[:5] + [f"... ({total - 15} lines hidden)"] + lines[-10:]
 
     def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
@@ -1963,6 +2011,64 @@ class GenericParser(Parser):
         return result
 
 
+class PackageInstallParser(Parser):
+    """Parser for npm/pnpm/yarn/pip/bundle install: deduplicate noise, surface summary."""
+
+    NPM_ADDED_RE = re.compile(r"added (\d+) packages?")
+    NPM_UPDATED_RE = re.compile(r"(?:updated|changed) (\d+) packages?")
+    NPM_REMOVED_RE = re.compile(r"removed (\d+) packages?")
+    NPM_DEPRECATED_RE = re.compile(r"^npm warn deprecated (\S+)@", re.MULTILINE)
+    PIP_INSTALLED_RE = re.compile(r"^Successfully installed (.+)$", re.MULTILINE)
+    PIP_ALREADY_RE = re.compile(r"^Requirement already satisfied:", re.MULTILINE)
+    PIP_COLLECTING_RE = re.compile(r"^Collecting (\S+)", re.MULTILINE)
+    BUNDLE_USING_RE = re.compile(r"^Using \S+ \(", re.MULTILINE)
+    PNPM_RE = re.compile(r"packages are looking for funding")
+
+    def parse(self, output: str, git_root: Optional[Path], config: Config) -> Result:
+        result = Result(tool="install", exit_code=0, duration=0)
+        lines = output.splitlines()
+
+        added = 0
+        updated = 0
+        removed = 0
+        deprecated: list[str] = []
+        installed_pkgs: list[str] = []
+        already_count = 0
+        collecting_count = 0
+        using_count = 0
+
+        if m := self.NPM_ADDED_RE.search(output):
+            added = int(m.group(1))
+        if m := self.NPM_UPDATED_RE.search(output):
+            updated = int(m.group(1))
+        if m := self.NPM_REMOVED_RE.search(output):
+            removed = int(m.group(1))
+
+        for m in self.NPM_DEPRECATED_RE.finditer(output):
+            pkg = m.group(1)
+            if pkg not in deprecated:
+                deprecated.append(pkg)
+
+        if m := self.PIP_INSTALLED_RE.search(output):
+            installed_pkgs = m.group(1).split()
+
+        already_count = len(self.PIP_ALREADY_RE.findall(output))
+        collecting_count = len(self.PIP_COLLECTING_RE.findall(output))
+        using_count = len(self.BUNDLE_USING_RE.findall(output))
+
+        result.extra["install_added"] = added
+        result.extra["install_updated"] = updated
+        result.extra["install_removed"] = removed
+        result.extra["install_deprecated"] = deprecated[:5]
+        result.extra["install_pkgs"] = installed_pkgs[:10]
+        result.extra["install_already"] = already_count
+        result.extra["install_collecting"] = collecting_count
+        result.extra["install_using"] = using_count
+        result.extra["install_total_lines"] = len(lines)
+        result.total = added + updated + collecting_count
+        return result
+
+
 # ─── Parser Registry ──────────────────────────────────────────────────────────
 
 PARSERS: dict[str, Parser] = {
@@ -1988,6 +2094,7 @@ PARSERS: dict[str, Parser] = {
     "grep": GrepRgParser(),
     "ls_tree": LsTreeParser(),
     "generic": GenericParser(),
+    "install": PackageInstallParser(),
 }
 
 
@@ -2270,16 +2377,17 @@ def _format_docker_logs(result: Result, config: Config) -> str:
     errors = result.extra.get("docker_logs_errors", [])
     tail = result.extra.get("docker_logs_tail", [])
     total = result.extra.get("docker_logs_total", 0)
-    parts: list[str] = [_meta_line("docker_logs", result.exit_code, f"{total} lines")]
+    shown = len(tail)
+    summary_bits = [f"{total} lines"]
+    if total > shown:
+        summary_bits.append(f"last {shown} shown")
+    parts: list[str] = [_meta_line("docker_logs", result.exit_code, ", ".join(summary_bits))]
     if config.quiet:
         return "\n".join(parts)
     if errors:
         parts.append(f"errors ({len(errors)}):")
         parts.extend(f"  {e}" for e in errors)
-    shown = tail[-30:]
-    if total > len(shown):
-        parts.append(f"--- last {len(shown)} lines ---")
-    parts.extend(shown)
+    parts.extend(tail)
     _maybe_full_path(parts, result)
     return "\n".join(parts)
 
@@ -2312,12 +2420,28 @@ def _format_cargo_build(result: Result, config: Config) -> str:
     errors = result.extra.get("cargo_errors", [])
     warnings = result.extra.get("cargo_warnings", 0)
     total_errors = result.errors
-    parts: list[str] = [_meta_line("cargo", result.exit_code, f"{total_errors} errors", f"{warnings} warnings")]
+    parts: list[str] = [_meta_line("cargo", result.exit_code, f"{total_errors} errors", f"{warnings} warnings" if warnings else "")]
     if config.quiet:
         return "\n".join(parts)
+    # Group by error code for compact output
+    grouped: dict[str, list[dict]] = {}
     for e in errors:
-        loc = f" [{e['loc']}]" if e.get("loc") else ""
-        parts.append(f"{e['code']}: {e['msg']}{loc}")
+        grouped.setdefault(e["code"], []).append(e)
+    total_shown = 0
+    for code, group in sorted(grouped.items(), key=lambda x: -len(x[1])):
+        if total_shown >= config.max_failures:
+            break
+        msg = group[0]["msg"]
+        if len(msg) > 120:
+            msg = msg[:117] + "..."
+        locs = [e["loc"] for e in group[:4] if e.get("loc")]
+        loc_str = ", ".join(locs)
+        remaining_in_group = len(group) - len(locs)
+        if remaining_in_group > 0:
+            loc_str += f" +{remaining_in_group}"
+        count_str = f" x{len(group)}" if len(group) > 1 else ""
+        parts.append(f"{code}{count_str}: {msg}" + (f" [{loc_str}]" if loc_str else ""))
+        total_shown += 1
     hidden = total_errors - len(errors)
     if hidden > 0:
         parts.append(f"+{hidden} more errors")
@@ -2442,6 +2566,49 @@ def _format_biome(result: Result, config: Config) -> str:
     return "\n".join(parts)
 
 
+def _format_install(result: Result, config: Config) -> str:
+    added = result.extra.get("install_added", 0)
+    updated = result.extra.get("install_updated", 0)
+    removed = result.extra.get("install_removed", 0)
+    deprecated = result.extra.get("install_deprecated", [])
+    pkgs = result.extra.get("install_pkgs", [])
+    already = result.extra.get("install_already", 0)
+    collecting = result.extra.get("install_collecting", 0)
+    using = result.extra.get("install_using", 0)
+    total_lines = result.extra.get("install_total_lines", 0)
+
+    bits: list[str] = []
+    if added:
+        bits.append(f"{added} added")
+    if updated:
+        bits.append(f"{updated} updated")
+    if removed:
+        bits.append(f"{removed} removed")
+    if pkgs:
+        pkg_str = " ".join(pkgs[:5])
+        if len(pkgs) > 5:
+            pkg_str += f" +{len(pkgs) - 5}"
+        bits.append(f"installed: {pkg_str}")
+    if collecting and not pkgs and not added:
+        bits.append(f"{collecting} packages")
+    if using and not pkgs and not added and not collecting:
+        bits.append(f"{using} packages")
+    if already and not bits:
+        bits.append(f"{already} already satisfied")
+    if not bits:
+        bits.append(f"{total_lines} lines")
+
+    parts: list[str] = [_meta_line("install", result.exit_code, ", ".join(bits))]
+    if config.quiet:
+        return "\n".join(parts)
+    for pkg in deprecated[:3]:
+        parts.append(f"  deprecated: {pkg}")
+    if len(deprecated) > 3:
+        parts.append(f"  +{len(deprecated) - 3} more deprecated")
+    _maybe_full_path(parts, result)
+    return "\n".join(parts)
+
+
 def _maybe_passthrough_tiny(result: Result, config: Config, raw_output: str, formatted: str) -> Optional[str]:
     """Return raw output (prefixed with `exit:N`) for tiny payloads where wrun's
     meta line costs more tokens than the parser saves.
@@ -2471,11 +2638,242 @@ def _maybe_passthrough_tiny(result: Result, config: Config, raw_output: str, for
     return None
 
 
+# ─── Ultra-compact transformer ────────────────────────────────────────────────
+
+_UC_META_RE = re.compile(r"^exit:(\d+)\s*\|\s*(\S+)\s*\|\s*(.+)$")
+_UC_FAIL_TEST_RE = re.compile(
+    r"^FAIL\s+(\S+?)(?::(\d+))?\s*::\s*(\S+)(?:\s*[—\-]+\s*(.+))?$"
+)
+_UC_LINT_RE = re.compile(
+    r"^(\S+)\s+x(\d+)(?:\s+\[(\w+)\])?:\s+(.+?)\s+\[([^\]]+)\]$"
+)
+_UC_MORE_RE = re.compile(r"^\+(\d+)\s+more.*$")
+_UC_FIXABLE_RE = re.compile(r"^(\d+)\s+fixable\s+with\s+--\w+$")
+_UC_FULL_RE = re.compile(r"^full:\s+(.+)$")
+_UC_DOCKER_ERR_HDR_RE = re.compile(r"^errors\s+\((\d+)\):$")
+
+
+def _compact_segment(seg: str) -> str:
+    """Compact a single pipe-separated metadata segment."""
+    seg = seg.strip()
+    if not seg:
+        return ""
+
+    # "N passed, M failed" → "MF/N"
+    pm = re.search(r"(\d+)\s+passed", seg)
+    fm = re.search(r"(\d+)\s+failed", seg)
+    if pm and fm:
+        p, f = int(pm.group(1)), int(fm.group(1))
+        return f"{f}F/{p + f}"
+    if fm:
+        return f"{fm.group(1)}F"
+    if pm:
+        return f"{pm.group(1)}p"
+
+    # "N errors[, M warnings]" or "M warnings"
+    em = re.search(r"(\d+)\s+errors?", seg)
+    wm = re.search(r"(\d+)\s+warnings?", seg)
+    if em or wm:
+        parts_ew = []
+        if em:
+            parts_ew.append(f"{em.group(1)}e")
+        if wm:
+            parts_ew.append(f"{wm.group(1)}w")
+        # check for additional tokens like "clean"
+        rest = re.sub(r"\d+\s+errors?\s*,?\s*", "", seg)
+        rest = re.sub(r"\d+\s+warnings?\s*,?\s*", "", rest).strip()
+        if "clean" in rest.lower():
+            parts_ew.append("clean")
+        return " ".join(parts_ew)
+
+    # status change counts: "1 modified, 2 added, 1 untracked"
+    change_map = [
+        ("modified", "M"), ("added", "A"), ("deleted", "D"),
+        ("renamed", "R"), ("untracked", "?"), ("conflict", "C"), ("typechange", "T"),
+    ]
+    change_parts: list[str] = []
+    for word, abbrev in change_map:
+        cm = re.search(rf"(\d+)\s+{word}", seg)
+        if cm:
+            change_parts.append(f"{cm.group(1)}{abbrev}")
+    if change_parts:
+        return " ".join(change_parts)
+
+    # "N running[, M stopped]"
+    rm = re.search(r"(\d+)\s+running", seg)
+    sm = re.search(r"(\d+)\s+stopped", seg)
+    if rm or sm:
+        res = ""
+        if rm:
+            res += f"{rm.group(1)}↑"
+        if sm:
+            res += f"{sm.group(1)}↓"
+        return res
+
+    # "N files" → Nf
+    m = re.match(r"(\d+)\s+files?$", seg)
+    if m:
+        return f"{m.group(1)}f"
+
+    # "N commits" → Nc
+    m = re.match(r"(\d+)\s+commits?$", seg)
+    if m:
+        return f"{m.group(1)}c"
+
+    # "N lines[, last M shown]" → Nl
+    m = re.match(r"(\d+)\s+lines?", seg)
+    if m:
+        return f"{m.group(1)}l"
+
+    # "N dirs" → Nd
+    m = re.match(r"(\d+)\s+dirs?", seg)
+    if m:
+        return f"{m.group(1)}d"
+
+    # "N images" → Nimg
+    m = re.match(r"(\d+)\s+images?$", seg)
+    if m:
+        return f"{m.group(1)}img"
+
+    # "on BRANCH" → BRANCH
+    m = re.match(r"on\s+(\S+)$", seg)
+    if m:
+        return m.group(1)
+
+    # "N noise hidden" → -N
+    m = re.match(r"(\d+)\s+noise\s+hidden$", seg)
+    if m:
+        return f"-{m.group(1)}"
+
+    # Duration: keep as-is ("0.3s", "15ms", "2.1s")
+    if re.match(r"[\d.]+(?:µs|ms|s)$", seg):
+        return seg
+
+    # "+N -M" diff stats → keep as-is
+    if re.match(r"[+\-]\d+", seg):
+        return seg
+
+    # reporter=X → skip (omit from ultra-compact)
+    if seg.startswith("reporter="):
+        return ""
+
+    # "clean", "∅", status words → keep
+    return seg
+
+
+def _compact_locs_str(locs: str) -> str:
+    """Compact location list: 'file:1, file2:5, +3' → 'file:1+3'"""
+    more_m = re.search(r"\+(\d+)(?:\s+more)?$", locs.strip())
+    more = int(more_m.group(1)) if more_m else 0
+
+    base = locs[: more_m.start()].strip().rstrip(",").strip() if more_m else locs
+
+    loc_parts = [ln.strip() for ln in base.split(",") if ln.strip()]
+    if not loc_parts:
+        return locs
+
+    first = loc_parts[0]
+    # Shorten path: keep last component only
+    if "/" in first or "\\" in first:
+        path_p, _, line_p = first.rpartition(":")
+        if not line_p.isdigit():
+            path_p, line_p = first, ""
+        short = re.split(r"[/\\]", path_p)[-1]
+        first = f"{short}:{line_p}" if line_p else short
+
+    remaining = len(loc_parts) - 1 + more
+    if remaining > 0:
+        return f"{first}+{remaining}"
+    return first
+
+
+def _to_ultra_compact(text: str) -> str:
+    """Transform normal wrun output to ultra-compact format."""
+    lines = text.split("\n")
+    out: list[str] = []
+
+    for line in lines:
+        # ── Meta line: exit:N | tool | seg1 | seg2 ... ──────────────────────
+        m = _UC_META_RE.match(line)
+        if m:
+            exit_n, tool_name, rest = m.group(1), m.group(2), m.group(3)
+            icon = "✓" if exit_n == "0" else "✗"
+            segs = rest.split(" | ")
+            compact_segs = [_compact_segment(s) for s in segs]
+            compact_rest = " ".join(s for s in compact_segs if s)
+            out.append(f"{icon}{tool_name} {compact_rest}".rstrip())
+            continue
+
+        # ── Test failure: FAIL file:line :: name — message ───────────────────
+        m = _UC_FAIL_TEST_RE.match(line)
+        if m:
+            _file = m.group(1) or ""
+            line_num = m.group(2) or ""
+            test_name = m.group(3) or "?"
+            message = (m.group(4) or "").strip()
+            loc = f"@{line_num}" if line_num else ""
+            if message:
+                if len(message) > 120:
+                    message = message[:117] + "..."
+                out.append(f"✗{test_name}{loc}: {message}")
+            else:
+                out.append(f"✗{test_name}{loc}")
+            continue
+
+        # ── Lint issue: CODE xN [sev]: msg [locs] ────────────────────────────
+        m = _UC_LINT_RE.match(line)
+        if m:
+            code = m.group(1)
+            count = m.group(2)
+            sev = m.group(3)
+            msg = m.group(4)
+            locs = m.group(5)
+            count_str = f"×{count}" if int(count) > 1 else ""
+            sev_str = f"[{sev[0]}]" if sev else ""
+            compact_locs = _compact_locs_str(locs)
+            if len(msg) > 80:
+                msg = msg[:77] + "..."
+            out.append(f"{code}{count_str}{sev_str} {msg}[{compact_locs}]")
+            continue
+
+        # ── "+N more X" → "+N" ───────────────────────────────────────────────
+        m = _UC_MORE_RE.match(line)
+        if m:
+            out.append(f"+{m.group(1)}")
+            continue
+
+        # ── "N fixable with --fix/--write" → "Nfix" ──────────────────────────
+        m = _UC_FIXABLE_RE.match(line)
+        if m:
+            out.append(f"{m.group(1)}fix")
+            continue
+
+        # ── "full: path" → "→path" ───────────────────────────────────────────
+        m = _UC_FULL_RE.match(line)
+        if m:
+            out.append(f"→{m.group(1)}")
+            continue
+
+        # ── "errors (N):" → "err N:" ─────────────────────────────────────────
+        m = _UC_DOCKER_ERR_HDR_RE.match(line)
+        if m:
+            out.append(f"err {m.group(1)}:")
+            continue
+
+        # ── All other lines pass through unchanged ────────────────────────────
+        out.append(line)
+
+    return "\n".join(out)
+
+
 def format_result(result: Result, config: Config, raw_output: str) -> str:
     """Format the parsed result into maximum token-efficient output for LLM."""
     formatted = _format_result_impl(result, config, raw_output)
     passthrough = _maybe_passthrough_tiny(result, config, raw_output, formatted)
-    return passthrough if passthrough is not None else formatted
+    result_text = passthrough if passthrough is not None else formatted
+    if config.compact and not config.json_output and not config.full:
+        result_text = _to_ultra_compact(result_text)
+    return result_text
 
 
 def _format_result_impl(result: Result, config: Config, raw_output: str) -> str:
@@ -2504,6 +2902,8 @@ def _format_result_impl(result: Result, config: Config, raw_output: str) -> str:
         return _format_ls_tree(result, config)
     if result.tool == "biome":
         return _format_biome(result, config)
+    if result.tool == "install":
+        return _format_install(result, config)
 
     parts: list[str] = []
 
@@ -2709,6 +3109,8 @@ def save_raw_output(output: str, tool: str) -> str:
 
 def run(cmd_parts: list[str], config: Config) -> int:
     """Execute command and produce optimized output."""
+    if os.environ.get("WRUN_COMPACT") == "0":
+        config.compact = False
     git_root = get_git_root()
     tool = detect_tool(cmd_parts)
 
@@ -2815,6 +3217,8 @@ def parse_args(argv: list[str]) -> tuple[Config, list[str]]:
             config.max_failures = int(arg.split("=", 1)[1])
         elif arg.startswith("--max-lines="):
             config.max_lines = int(arg.split("=", 1)[1])
+        elif arg == "--no-compact":
+            config.compact = False
         else:
             cmd_start = i
             found_command = True
@@ -2827,6 +3231,8 @@ def parse_args(argv: list[str]) -> tuple[Config, list[str]]:
 
 def run_stdin(config: Config) -> int:
     """Process stdin and produce optimized output."""
+    if os.environ.get("WRUN_COMPACT") == "0":
+        config.compact = False
     git_root = get_git_root()
     raw_output = sys.stdin.read()
 

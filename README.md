@@ -1,14 +1,14 @@
 # wrun
 
-Token-optimized command wrapper for AI coding agents. Wraps test runners, linters, VCS tools, and filesystem commands to produce minimal, actionable output — reducing token consumption up to 89% on verbose commands.
+Token-optimized command wrapper for AI coding agents. Wraps test runners, linters, VCS tools, and filesystem commands to produce minimal, actionable output — reducing token consumption **87–97% on verbose commands** (144 674 raw tokens → 4 714 after wrun across the full test corpus).
 
 ## Why
 
 AI coding agents (Claude Code, OpenCode, Cursor, etc.) waste context window on verbose tool output. A `docker ps` with 33 containers emits 11 KB of tabular data that AI has to parse to answer "is the API up?". A pytest run with 3 failures produces 50+ lines of framework noise hiding the 3 line:column pairs the agent needs. A `git diff` emits thousands of `+`/`-` lines when `file +N -M` is enough to decide the next action.
 
-wrun sits between the agent and the tool: it runs the command, parses the output with a tool-specific parser, and emits a canonical one-line-summary + compact details format the agent can act on without rereading the whole blob.
+wrun sits between the agent and the tool: it runs the command, parses the output with a tool-specific parser, and emits ultra-compact output the agent can act on without rereading the whole blob.
 
-Nothing is lost — the full output is always saved to `~/.local/share/wrun/*.log`. A `full: <path>` pointer is appended only when it adds value: when output was truncated, when the raw log has materially more lines than what was rendered, or when a non-zero exit produced substantial output. Compact, complete responses (e.g. `exit:0 | git_status | clean`) stay clean — no noisy pointer.
+Nothing is lost — the full output is always saved to `~/.local/share/wrun/*.log`. A `→path` pointer is appended only when it adds value: when output was truncated, when the raw log has materially more lines than what was rendered, or when a non-zero exit produced substantial output. Compact, complete responses (e.g. `✓git_status main clean`) stay clean — no noisy pointer.
 
 ## Install
 
@@ -81,6 +81,7 @@ wrun tsc --noEmit
 wrun docker ps
 wrun git log --oneline -20
 wrun --full docker ps           # bypass optimization, just strip ANSI + relativize paths
+wrun --no-compact git status    # verbose format (disable ultra-compact)
 pytest tests/ 2>&1 | wrun --stdin --tool pytest   # pipe mode
 ```
 
@@ -88,6 +89,7 @@ pytest tests/ 2>&1 | wrun --stdin --tool pytest   # pipe mode
 
 ```
 --full              Bypass optimization (still strips ANSI + relativizes paths)
+--no-compact        Disable ultra-compact mode (use verbose format)
 --json              Structured JSON output
 -q, --quiet         Summary line only
 --max-failures N    Max failures/entries to display (default: 10)
@@ -96,6 +98,8 @@ pytest tests/ 2>&1 | wrun --stdin --tool pytest   # pipe mode
 --stdin             Read from stdin instead of executing
 --tool TOOL         Hint parser for --stdin mode
 ```
+
+Set `WRUN_COMPACT=0` to disable ultra-compact globally (e.g. for scripting).
 
 ## Supported tools
 
@@ -116,39 +120,52 @@ pytest tests/ 2>&1 | wrun --stdin --tool pytest   # pipe mode
 | **git log / show** | `GitLogParser` | `hash subject` one per line, handles `--graph`/`--oneline` |
 | **git add/commit/push/pull/…** | `GitWriteParser` | 1-line summary (commit SHA, refspec update, etc.) |
 | **docker ps / images** | `DockerPsParser` | ID, name, image, status, compact ports (IPv4+IPv6 dedup) |
+| **docker logs** | `DockerLogsParser` | timestamps stripped, repeated errors collapsed (`msg x47`), 30-line tail deduped |
 | **grep / rg / ag** | `GrepRgParser` | grouped by file, capped 50 total / 10 per file, line-number optional |
 | **ls / tree** | `LsTreeParser` | compact listing, filters `.`, `..`, and noise dirs recursively |
+
+### Build & infra
+| Tool | Parser | Extracts |
+|---|---|---|
+| **cargo** | `CargoParser` | errors grouped by code (`E0001 x2: msg [a.rs:10+1]`), warnings count, test panics |
+| **make / cmake** | `MakeParser` | error lines, warning count, last targets |
+| **kubectl** | `KubectlParser` | table/describe/apply/logs mode, log line deduplication |
+
+### Package managers
+| Tool | Parser | Extracts |
+|---|---|---|
+| **npm / pnpm / yarn / bun install** | `PackageInstallParser` | added/updated/removed counts, deprecated warnings |
+| **pip install / uv add / bundle install** | `PackageInstallParser` | installed packages, already-satisfied count |
 
 ### Fallback
 | Tool | Parser | Features |
 |---|---|---|
-| **anything else** | `GenericParser` | Error-pattern extraction with ±1 line context (not blind head+tail) |
+| **anything else** | `GenericParser` | Error-pattern extraction with ±1 line context; smart install/download detection (ultra-compressed for benign verbose output) |
 
 Noise directories auto-hidden by `ls`/`tree`: `node_modules`, `.git`, `__pycache__`, `.venv`, `venv`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, `dist`, `build`, `.next`, `.nuxt`, `target`, `.idea`, `.vscode`.
 
 ## Real output examples
 
-All examples below are captured from actual command runs in a fresh test repo, no hand-editing.
+All examples below are captured from actual command runs, no hand-editing. Ultra-compact is the default format.
 
 ### pytest
 
 ```
-exit:0 | pytest | 1 passed | 0.20s
+✓pytest 1p 0.20s
 ```
 
 3 failures out of 11 tests:
 ```
-exit:1 | pytest | 8 passed, 3 failed | 0.3s
-FAIL tests/test_auth.py:8 :: test_login — AssertionError: Expected 200, got 401 | assert 401 == 200
-FAIL tests/test_db.py:42 :: test_query — TypeError: NoneType has no len()
-FAIL tests/test_api.py:15 :: test_post — ConnectionError: connection refused
+✗pytest 3F/11 0.3s
+✗test_login@8: AssertionError: Expected 200, got 401 | assert 401 == 200
+✗test_query@42: TypeError: NoneType has no len()
+✗test_post@15: ConnectionError: connection refused
 ```
 
 ### git status (multi-state repo — modified, added, deleted, renamed, untracked)
 
-Raw: 11 lines / 302 B → wrun: 6 lines / 176 B
 ```
-exit:0 | git_status | on main | 1 modified, 1 added, 1 deleted, 1 renamed, 1 untracked
+✓git_status main 1M 1A 1D 1R 1?
 A  src/added.py
  M src/b.py
  D src/c.py
@@ -158,9 +175,9 @@ R  src/a.py -> src/renamed.py
 
 ### git diff HEAD
 
-Raw: 25 lines / 513 B → wrun: 5 lines / 107 B (**79% reduction**)
+Raw: 25 lines / 513 B → wrun: 5 lines / 55 B (**74% token reduction**)
 ```
-exit:0 | git_diff | 4 files | +2 -2
+✓git_diff 4f +2-2
 A src/added.py +1 -0
 M src/b.py +1 -1
 D src/c.py +0 -1
@@ -169,10 +186,8 @@ M src/renamed.py
 
 ### git diff --name-only origin/master...HEAD
 
-`--name-only`, `--name-status`, and `--numstat` are the fastest diff shapes AI agents reach for. They all get parsed into the same canonical table — no more silent "no changes" when the raw output was a list of 10+ bare paths.
-
 ```
-exit:0 | git_diff | 10 files
+✓git_diff 10f
 M api/app/api/routes/admin.py
 M api/app/repositories/users.py
 M api/tests/test_admin_dashboard_stats.py
@@ -183,9 +198,8 @@ M front/src/pages/admin/DashboardPage.tsx
 
 ### git log
 
-Raw: 29 lines / 623 B → wrun: 6 lines / 148 B (**77% reduction**)
 ```
-exit:0 | git_log | 4 commits
+✓git_log 4c
 c04d2dc test commit body
 a068946 feat: add src layout
 7c0f71f feat: add readme
@@ -194,27 +208,26 @@ fa72488 initial
 
 ### git commit
 
-Raw: 6 lines / 192 B → wrun: 1 line / 71 B (**82% reduction**)
 ```
-exit:0 | git_write | commit c04d2dc on main: test commit body (4 files)
+✓git_write commit c04d2dc on main: test commit body (4 files)
 ```
 
 ### docker ps (33 running containers)
 
-Raw: 37 lines / 11 792 B → wrun: 17 lines / 1 351 B (**89% reduction**)
+Raw: 37 lines / 11 792 B → wrun: 17 lines / 1 351 B (**66% token reduction**)
 ```
-exit:0 | docker_ps | 33 running
+✓docker_ps 33↑
 3200e45dfde8 crm-api-bt-868j96khh-ca crm-bt-868j96khh-ca-api Up 3 minutes (healthy) :8121
 ba8a8e68279d crm-realtime-bt-868j96khh-ca crm-bt-868j96khh-ca-realtime Up 3 minutes 8000/tcp,:8171
 9b43fe0835e4 crm-meilisearch-branch-test getmeili/meilisearch:v1.12 Up 3 minutes (healthy) :7710
 …
-+21 more
++21
 ```
 
 ### grep / rg (grouped by file)
 
 ```
-exit:0 | grep | 3 matches in 2 files
+✓grep 3/2f
 ./sample.py (2):
   1: def foo():
   3: def bar():
@@ -224,83 +237,76 @@ exit:0 | grep | 3 matches in 2 files
 
 ### ls -la (with noise dirs + `.` and `..` filtered)
 
-Raw: 11 lines / 529 B → wrun: 5 lines / 119 B (**78% reduction**)
+Raw: 11 lines / 529 B → wrun: 5 lines / 45 B (**86% token reduction**)
 ```
-exit:0 | ls | 2 dirs, 2 files, 6 noise hidden
+✓ls 2d 2f -6
 F       10 README.md
 F       60 sample.py
 D     4096 src
 D     4096 tests
 ```
 
-### tree -L 2 (noise subtrees pruned recursively)
-
-Raw: 17 lines / 343 B → wrun: 12 lines / 269 B (**22% reduction**)
-```
-exit:0 | tree | 11 entries, 4 noise hidden
-.
-├── README.md
-├── sample.py
-├── src
-│   ├── added.py
-│   ├── b.py
-│   ├── renamed.py
-│   ├── skip.py
-│   └── untracked.py
-└── tests
-    └── t.py
-```
-
 ### ruff (lint errors grouped by rule)
 
 ```
-exit:1 | ruff | 6 errors
-F401 x3: `os` imported but unused [src/api.py:1, src/db.py:1, src/util.py:1]
-E302 x2: Expected 2 blank lines [src/api.py:15, src/db.py:22]
-E501 x1: Line too long [src/util.py:88]
-3 fixable with --fix
+✗ruff 6F
+F401×3 `os` imported but unused[api.py:1+2]
+E302×2 expected 2 blank lines, found 1[api.py:15+1]
+E501 line too long (95 > 79 characters)[util.py:88]
+3fix
 ```
 
 ### biome (full reporter coverage: pretty / summary / json / github)
 
-Pretty reporter (default — Rust/miette-style diagnostics with `━ × ⚠ ℹ` glyphs):
+Pretty reporter (default):
 
 ```
-exit:1 | biome | 2 errors, 1 warning | 3 files | 15ms
-lint/suspicious/noExplicitAny x1: Unexpected any. Specify a different type. [./src/App.tsx:12]
-lint/correctness/noUnusedVariables x1: This variable is unused. [./src/api/client.ts:45]
-lint/style/useConst x1 [warn]: This let declares a variable that is never reassigned. [./src/utils.ts:8]
-1 fixable with --write
+✗biome 2e 1w 3f 15ms
+lint/suspicious/noExplicitAny Unexpected any. Specify a different type.[App.tsx:12]
+lint/correctness/noUnusedVariables This variable is unused.[api/client.ts:45]
+lint/style/useConst[w] This let declares a variable that is never reassigned.[utils.ts:8]
+1fix
 ```
 
 Parse errors (syntax, non-lint category):
 
 ```
-exit:1 | biome | 1 error | 1 file | 2ms
-parse x1: Expected a semicolon or an implicit semicolon after a statement, but found none. [./src/broken.ts:5]
+✗biome 1e 1f 2ms
+parse Expected a semicolon or an implicit semicolon after a statement, but found none.[broken.ts:5]
 ```
 
 Format diagnostics (whole-file, no `:line:col`):
 
 ```
-exit:1 | biome | 2 errors | 2 files | 3ms
-format x2: File content differs from formatting output [./src/foo.ts, ./src/bar.ts]
-2 fixable with --write
-```
-
-JSON reporter (`biome check --reporter=json` — structured blob detected + normalized):
-
-```
-exit:1 | biome | 2 errors, 1 warning | 3 files | 15ms | reporter=json
-lint/suspicious/noExplicitAny x1: Unexpected any. Specify a different type. [./src/App.tsx]
-lint/correctness/noUnusedVariables x1: This variable is unused. [./src/api/client.ts]
-lint/style/useConst x1 [warn]: This let declares a variable that is never reassigned. [./src/utils.ts]
+✗biome 2e 2f 3ms
+format×2 File content differs from formatting output[foo.ts+1]
+2fix
 ```
 
 Clean run (no diagnostics):
 
 ```
-exit:0 | biome | clean | 12 files | 8ms
+✓biome clean 12f 8ms
+```
+
+### cargo (errors grouped by code)
+
+```
+✗cargo 3e 2w
+E0001×2: cannot find value `x` in this scope [main.rs:10+1]
+E0308: mismatched types [lib.rs:5]
+```
+
+### npm / pip install
+
+```
+✓install +234
+  deprecated: inflight
+  deprecated: glob
+```
+
+```
+✓install installed: certifi-2023.7.22 requests-2.31.0 urllib3-2.0.7
 ```
 
 ## Measured reduction — 81-case harness
@@ -328,72 +334,73 @@ python3 tests/token_report.py
 
 | Tool · case | Raw B | Wrun B | Raw tok | Wrun tok | Δ bytes | Δ tokens |
 |---|---:|---:|---:|---:|---:|---:|
-| pytest 3 failures (corpus) | 2 462 | 310 | 491 | 85 | **−87%** | **−83%** |
-| pytest 3 failures + `--quiet` | 2 462 | 45 | 491 | 20 | **−98%** | **−96%** |
-| pytest 3 failures + `--max-failures=1` | 2 462 | 155 | 491 | 49 | **−94%** | **−90%** |
+| pytest 3 failures (corpus) | 2 462 | 209 | 491 | 67 | **−91%** | **−87%** |
+| pytest 3 failures + `--quiet` | 2 462 | 22 | 491 | 14 | **−99%** | **−97%** |
+| pytest 3 failures + `--max-failures=1` | 2 462 | 91 | 491 | 37 | **−96%** | **−92%** |
 | pytest `--json` | 2 462 | 563 | 491 | 155 | **−77%** | **−68%** |
-| pytest all-passing synthetic | 278 | 36 | 54 | 16 | **−87%** | **−70%** |
-| vitest 2 failures | 1 291 | 538 | 700 | 156 | **−58%** | **−77%** |
-| tsc 4 errors / 3 files | 516 | 273 | 160 | 96 | **−47%** | **−40%** |
-| ruff classic 6 errors | 359 | 255 | 130 | 97 | **−29%** | **−25%** |
-| ruff modern (Rust-style) | 392 | 156 | 131 | 59 | **−60%** | **−55%** |
-| biome pretty 3 errors (synthetic) | 1 104 | 325 | 278 | 95 | **−70%** | **−65%** |
-| biome warnings-only (synthetic) | 745 | 245 | 190 | 72 | **−67%** | **−62%** |
-| biome mixed err+warn+fixable | 1 089 | 366 | 262 | 108 | **−66%** | **−58%** |
-| biome format category | 760 | 149 | 185 | 46 | **−80%** | **−75%** |
-| biome many (15 diagnostics) | 2 906 | 395 | 678 | 134 | **−86%** | **−80%** |
-| biome summary reporter (aggregated) | 742 | 55 | 159 | 22 | **−92%** | **−86%** |
-| biome quiet mode | 1 089 | 54 | 262 | 22 | **−95%** | **−91%** |
-| **biome REAL 2.4.12 · pretty single-file** | 3 962 | 552 | 1 083 | 155 | **−86%** | **−85%** |
-| **biome REAL 2.4.12 · pretty multi-file (15 diags)** | 9 025 | 813 | 2 423 | 235 | **−91%** | **−90%** |
-| **biome REAL 2.4.12 · github reporter** | 2 356 | 800 | 601 | 232 | **−66%** | **−61%** |
-| **biome REAL 2.4.12 · summary reporter** | 1 881 | 73 | 409 | 26 | **−96%** | **−93%** |
-| **biome REAL 2.4.12 · JSON reporter** | 4 045 | 806 | 1 015 | 231 | **−80%** | **−77%** |
-| **biome REAL 2.4.12 · format-only** | 883 | 126 | 198 | 38 | **−85%** | **−80%** |
-| **biome REAL 2.4.12 · assist/organizeImports** | 1 523 | 210 | 382 | 59 | **−86%** | **−84%** |
-| docker_ps 2 containers (stdin) | 359 | 117 | 119 | 44 | **−67%** | **−63%** |
-| docker_ps Paused+Removing states | 375 | 165 | 95 | 58 | **−56%** | **−38%** |
-| `grep -Hn` self-source (real, ~4 KB) | 4 247 | 658 | ~1 040 | ~210 | **−84%** | **−79%** |
-| `ls -la` with noise dirs | 268 | 82 | 148 | 33 | **−69%** | **−77%** |
-| `tree -L 2` with deep noise | 194 | 123 | 62 | 41 | **−36%** | **−33%** |
-| git diff (2-file fixture) | 274 | 70 | 114 | 34 | **−74%** | **−70%** |
-| git diff `--name-only` (4 files) | 138 | 144 | 33 | 36 | +4% | +9% |
-| git log graph fixture | 93 | 109 | 34 | 36 | +17% | +5% |
-| git_status porcelain (already compact) | 34 | 89 | 15 | 35 | +161% | +133% |
-| grep multi-file (few matches) | 65 | 107 | 28 | 48 | +64% | +71% |
-| edge: 10 KB minified-style long line | 10 008 | 518 | 1 255 | 72 | **−94%** | **−94%** |
-| edge: OSC 8 hyperlinks (ruff modern) | 134 | 76 | 52 | 31 | **−43%** | **−40%** |
-| edge: heavy ANSI codes | 35 | 35 | 18 | 11 | +0% | **−38%** |
+| pytest all-passing synthetic | 278 | 20 | 54 | 12 | **−93%** | **−78%** |
+| vitest 2 failures | 1 291 | 350 | 700 | 116 | **−73%** | **−83%** |
+| tsc 4 errors / 3 files | 516 | 223 | 160 | 75 | **−57%** | **−53%** |
+| ruff classic 6 errors | 359 | 166 | 130 | 67 | **−54%** | **−48%** |
+| ruff modern (Rust-style) | 392 | 108 | 131 | 44 | **−72%** | **−66%** |
+| biome pretty 3 errors (synthetic) | 1 104 | 265 | 278 | 72 | **−76%** | **−74%** |
+| biome warnings-only (synthetic) | 745 | 186 | 190 | 55 | **−75%** | **−71%** |
+| biome mixed err+warn+fixable | 1 089 | 276 | 262 | 80 | **−75%** | **−69%** |
+| biome format category | 760 | 88 | 185 | 32 | **−88%** | **−83%** |
+| biome many (15 diagnostics) | 2 906 | 258 | 678 | 89 | **−91%** | **−86%** |
+| biome summary reporter (aggregated) | 742 | 23 | 159 | 17 | **−97%** | **−89%** |
+| biome quiet mode | 1 089 | 23 | 262 | 17 | **−98%** | **−93%** |
+| **biome REAL 2.4.12 · pretty single-file** | 3 962 | 441 | 1 083 | 119 | **−89%** | **−89%** |
+| **biome REAL 2.4.12 · pretty multi-file (15 diags)** | 9 025 | 597 | 2 423 | 161 | **−93%** | **−93%** |
+| **biome REAL 2.4.12 · github reporter** | 2 356 | 587 | 601 | 154 | **−75%** | **−74%** |
+| **biome REAL 2.4.12 · summary reporter** | 1 881 | 22 | 409 | 17 | **−99%** | **−95%** |
+| **biome REAL 2.4.12 · JSON reporter** | 4 045 | 592 | 1 015 | 158 | **−85%** | **−84%** |
+| **biome REAL 2.4.12 · format-only** | 883 | 96 | 198 | 28 | **−89%** | **−85%** |
+| **biome REAL 2.4.12 · assist/organizeImports** | 1 523 | 170 | 382 | 45 | **−89%** | **−88%** |
+| cargo: error with location | 250 | 102 | 80 | 39 | **−59%** | **−51%** |
+| cargo: clean build | 101 | 15 | 30 | 10 | **−85%** | **−66%** |
+| docker_ps 2 containers (stdin) | 359 | 104 | 119 | 41 | **−71%** | **−65%** |
+| docker_ps Paused+Removing states | 375 | 145 | 95 | 53 | **−61%** | **−44%** |
+| docker_logs: error surfacing + tail | 246 | 224 | 104 | 60 | **−9%** | **−42%** |
+| make: --max-failures respected | 521 | 106 | 259 | 55 | **−80%** | **−78%** |
+| `ls -la` with noise dirs | 268 | 45 | 148 | 21 | **−83%** | **−85%** |
+| `tree -L 2` with deep noise | 194 | 115 | 62 | 38 | **−41%** | **−38%** |
+| git diff (2-file fixture) | 274 | 55 | 114 | 30 | **−80%** | **−73%** |
+| git diff `--name-only` (4 files) | 138 | 145 | 33 | 37 | +5% | +12% |
+| git log graph fixture | 93 | 94 | 34 | 33 | +1% | +3% |
+| git_status porcelain (already compact) | 34 | 57 | 15 | 28 | +68% | +87% |
+| grep multi-file (few matches) | 65 | 99 | 28 | 45 | +52% | +61% |
+| generic: large benign output (install/download) | 14 289 | 130 | 2 999 | 32 | **−99%** | **−99%** |
+| edge: 10 KB minified-style long line | 10 008 | 518 | 1 255 | 72 | **−95%** | **−94%** |
+| edge: OSC 8 hyperlinks (ruff modern) | 134 | 53 | 52 | 23 | **−60%** | **−55%** |
+| edge: heavy ANSI codes | 35 | 35 | 18 | 11 | +0% | **−39%** |
 | edge: empty input (stdin) | 0 | 17 | 0 | 6 | - | - |
-| generic error-pattern extraction | 190 | 205 | 44 | 53 | +7% | +20% |
+| **AGGREGATED (81-case corpus)** | **1 089 347** | **15 852** | **144 674** | **4 714** | **−99%** | **−97%** |
 
 **Reading the table**:
-- Bold negative deltas = wrun wins. **Verbose + structured output** (pytest failures, biome pretty, docker lists, `grep -Hn`, 10 KB lines) dominates this region with 60–97% reductions.
-- Already-compact payloads (`git log --oneline`, `git status --porcelain`, small greps) show positive deltas because the `exit:N | tool | summary` meta line costs 20–70 bytes / 10–35 tokens. This is a *deliberate* trade-off: the canonical header gives the agent a zero-parse answer (`3 modified, 1 untracked` vs reparsing 5 porcelain codes).
-- Byte and token deltas usually agree within ±5 percentage points. Tokens can drop faster than bytes when the raw output has BPE-inefficient content — ANSI escapes (`\x1b[31m`), box-drawing (`━`), repeated indentation — which collapse heavily under GPT-4 BPE. Tokens can also drop *slower* than bytes when wrun replaces raw bytes with high-signal but BPE-expensive identifiers (e.g. `lint/correctness/noUnusedVariables`).
+- Bold negative deltas = wrun wins. **Verbose + structured output** (pytest failures, biome pretty, docker lists, cargo errors, 10 KB lines) dominates this region with 66–99% reductions.
+- Already-compact payloads (`git log --oneline`, `git status --porcelain`, small greps) show positive deltas because the meta header costs ~10–30 tokens. This is a *deliberate* trade-off: the canonical header gives the agent a zero-parse answer (`3M 1?` vs reparsing 4 porcelain codes).
+- Byte and token deltas usually agree within ±5 percentage points. Tokens can drop faster than bytes when the raw output has BPE-inefficient content — ANSI escapes (`\x1b[31m`), box-drawing (`━`), repeated indentation — which collapse heavily under GPT-4 BPE.
 
-**Why tokens matter more than bytes**: LLM context windows and billing are measured in tokens, not bytes. A 9 KB Biome pretty-reporter output costs ~2 423 tokens raw but only ~235 after wrun — a **90% token saving**, which means 10× more tool output fits before hitting context limits. For agents running dozens of tool calls per session this compounds into whole extra turns of productive work.
+**Why tokens matter more than bytes**: LLM context windows and billing are measured in tokens, not bytes. A 9 KB Biome pretty-reporter output costs ~2 423 tokens raw but only ~161 after wrun — a **93% token saving**, which means 15× more tool output fits before hitting context limits. For agents running dozens of tool calls per session this compounds into whole extra turns of productive work.
 
 ### Analysis of positive-delta cases (where wrun adds tokens)
 
-Six cases in the table show **positive deltas** — wrun output is larger than raw. These are deliberate tradeoffs, not regressions. Each row below breaks down what was added and whether it earns its cost:
+Five cases in the table show **positive deltas** — wrun output is larger than raw. These are deliberate tradeoffs, not regressions:
 
 | Case | Δ tok | Tokens added | Value added | Verdict |
 |---|---:|---|---|---|
-| `git_status` porcelain (`M/?? /A`) | **+20** | `exit:0 \| git_status \| 1 modified, 1 added, 1 untracked` (~20 tok) | Zero-parse rollup — agent reads "1 modified, 1 added, 1 untracked" instead of mentally reducing 3 porcelain codes | ✅ Tradeoff — value grows with entry count; a 30-file porcelain status still wins big |
-| `grep` multi-file (few matches) | **+20** | Meta line + per-file `./file.py (N):` headers | Grouping by file + count. With 3 matches overhead is significant; with 50+ matches the grouping is essential | ✅ Tradeoff — same structure scales to 1000+ matches |
-| `git diff --name-only` (4 paths) | **+3** | Single `exit:0\n` line prefix | Zero-byte transformation; agent still gets the canonical exit code signal | ✅ Heavily optimized across 2 passes: +15 tok → +10 tok (dropped `M ` prefix) → +3 tok (adaptive passthrough skips meta line when raw already fits the shape) |
+| `git_status` porcelain (`M/?? /A`) | **+13** | `✓git_status main 1M 1A 1?` (~13 tok) | Zero-parse rollup — agent reads "1M 1A 1?" instead of mentally reducing 3 porcelain codes | ✅ Tradeoff — value grows with entry count; a 30-file porcelain status saves ~90% |
+| `grep` multi-file (few matches) | **+17** | Meta line + per-file `./file.py (N):` headers | Grouping by file + count. With 3 matches overhead is significant; with 50+ matches the grouping is essential | ✅ Tradeoff — same structure scales to 1000+ matches |
+| `git diff --name-only` (4 paths) | **+4** | Single `exit:0\n` line prefix | Zero-byte transformation; agent still gets the canonical exit code signal | ✅ Near break-even — adaptive passthrough skips meta line when raw already fits the shape |
 | `generic` error-pattern extraction | **+9** | `exit:N \| generic` meta line | Tells agent: parser didn't recognize the tool, used error-pattern heuristic | ✅ Small cost, informative |
-| `git log` graph fixture | **+2** | Meta line; offset by removal of graph chars (`* `, `\|\\`, `\| *`) | Near break-even. BPE-expensive graph glyphs collapse cleanly into oneline format | ✅ Effectively neutral |
-| `edge` empty input | **+6** | `exit:0 \| generic` for an empty stdin | Agent distinguishes "command ran, no output" from "command never executed / pipe broken" | ✅ Diagnostic signal from null-value input |
+| `git log` graph fixture | **+2** | Meta line; offset by removal of graph chars (`* `, `\|\\`) | Near break-even. BPE-expensive graph glyphs collapse cleanly | ✅ Effectively neutral |
 
-**Pattern**: positive deltas cluster around **already-compact inputs** (≤ 200 bytes raw). The fixed cost of the `exit:N | tool | summary` header is ~10-20 tokens, which is ≤ 3 % of a verbose output but ≥ 30 % of a 3-line raw payload. For scale-varying tools (`git_status`, `grep`, `ls`) the same emitted structure that looks expensive on tiny inputs dominates the savings on real-world inputs — a production `git status` with 50 entries, or a `grep -rn` across 200 files, reaches the same ~−90 % territory as Biome's pretty reporter.
+**Pattern**: positive deltas cluster around **already-compact inputs** (≤ 200 bytes raw). For scale-varying tools (`git_status`, `grep`, `ls`) the same emitted structure that looks expensive on tiny inputs dominates the savings on real-world inputs — a production `git status` with 50 entries, or a `grep -rn` across 200 files, reaches the same ~−90% territory as Biome's pretty reporter.
 
 ### Adaptive passthrough (surgical)
 
-For cases where the parser performs **no semantic transformation** on the input — e.g. `git diff --name-only` emits a bare path list that agents consume as-is — wrun detects the pattern and skips the meta line entirely, emitting `exit:N\n<raw>` instead of `exit:N | git_diff | N files\n<paths>`. This drops the 4-path fixture from +30 % tokens (with meta) to +9 % tokens (passthrough) — the residual 3-token overhead is the `exit:0\n` signal agents parse.
-
-Passthrough is deliberately **not** applied to tools whose parser adds value — `grep` (file grouping), `git_status` (rollup), `git_log` (graph strip), `git_diff --name-status` (R100 → R normalization), `git_diff --numstat` (+N -M formatting), any lint/test tool (exit code + failure counts). In those cases the meta line's structured summary *is* the optimization, not overhead.
+For cases where the parser performs **no semantic transformation** — e.g. `git diff --name-only` emits a bare path list that agents consume as-is — wrun detects the pattern and skips the meta line entirely, emitting `exit:N\n<raw>`. This drops the 4-path fixture from +30% tokens (with meta) to +12% tokens (passthrough) — the residual overhead is the `exit:0\n` signal agents parse.
 
 Guards (all must hold for passthrough to engage):
 - `result.extra.get("git_diff_inferred_status") is True` — parser confirmed raw is pure path list
@@ -401,16 +408,7 @@ Guards (all must hold for passthrough to engage):
 - No `--json` / `--quiet` / `--full` flag
 - Raw input ≤ 200 bytes and meta version would be larger (≥ 8 byte overhead)
 
-**Not on the table but worth noting**: `heavy ANSI codes` edge case is **bytes +0 % but tokens −38 %**. Raw `\x1b[31mERROR\x1b[0m` is BPE-expensive (each escape code tokenizes into 3-4 sub-tokens); wrun strips ANSI and keeps the plain text, bytes stay roughly flat but tokens drop sharply. This is why token measurement matters — byte-only accounting underestimates the real agent-context savings on colorful CLI tools.
-
-**Possible micro-optimization (not yet implemented)**: when `git diff --name-only` detects no status info was provided (pure path list), drop the `M ` prefix to save ~4 tokens on that case. Would need a flag on `Result.extra` to distinguish "inferred status" from "real status". Queued for evaluation.
-
-**Observations**:
-- **Verbose output wins big** (60–99% reduction). This is the common AI-agent case: `docker ps`, `git log`, `ls -la`, `git diff`, `pytest` with failures, long build logs.
-- **Already-compact output adds a canonical header** (`--porcelain`, `--oneline`, single-file grep, empty diff). The `exit:N | tool | summary` line is 20–70 extra bytes, but gives the agent a one-glance answer without reparsing.
-- **`--quiet` compresses to one line regardless of failure count** (99% on pytest with 3 failures).
-- **Empty output becomes informative**: `git diff` with no changes produces 0 bytes raw vs `exit:0 | git_diff | no changes` in wrun. The agent can now distinguish "no diff" from "silent failure".
-- **Full output is never lost** — the raw log is always written to `~/.local/share/wrun/*.log`. The `full: <path>` pointer is appended only when output was truncated, materially reduced vs raw, or came from a failing command (exit ≠ 0 with >2 KB raw). Clean, compact responses don't carry the pointer.
+**Not on the table but worth noting**: `heavy ANSI codes` edge case is **bytes +0% but tokens −39%**. Raw `\x1b[31mERROR\x1b[0m` is BPE-expensive (each escape code tokenizes into 3-4 sub-tokens); wrun strips ANSI and keeps plain text, bytes stay roughly flat but tokens drop sharply. This is why token measurement matters — byte-only accounting underestimates real agent-context savings on colorful CLI tools.
 
 ## Edge cases covered
 
@@ -426,6 +424,7 @@ The harness exercises and validates:
 | Command not found (`execve` fails) | `exit:127` |
 | `git commit` with global flags (`git -c k=v commit`) | Subcommand detected correctly (skips `-c k=v`) |
 | `docker ps` IPv4 + IPv6 port pairs | Deduplicated (`0.0.0.0:80, [::]:80` → `:80`) |
+| `docker logs` repeated error lines | Collapsed (`ERROR: timeout x47`) |
 | `rg` without line numbers (`--no-line-number`) | Matches grouped under `(match)` |
 | `rg` single-file (no path prefix) | Same — no raw pass-through |
 | `tree` with noise subtrees (`node_modules`, `.git`) | Entire subtree pruned (indent-aware) |
@@ -439,23 +438,28 @@ The harness exercises and validates:
 | Biome 2.x JSON schema (ns duration, string path, line/column) | 2.x + 1.x schemas both supported |
 | Biome 2.x JSON preamble + `check ━` footer | Blob extracted from middle; footer ignored |
 | Biome summary reporter (`reporter/format ━`, `reporter/violations ━`) | Headers recognized; aggregate summary surfaced |
+| kubectl log lines repeated | Collapsed via deduplication |
+| `npm install` / `pip install` verbose output | PackageInstallParser: counts + deprecated warnings only |
 
 ## Optimization techniques
 
-1. **ANSI stripping** — CSI, OSC 8 hyperlinks, OSC sequences (BEL/ST terminators), private mode
-2. **Path normalization** — relative to git root, worktree-aware, resolves `../../` traversals back to absolute when outside the project
-3. **Tool-specific parsers** — 17 parser classes, 22 registry entries counting aliases (mypy/ty → TscParser, ag → GrepRgParser, etc.)
-4. **Failures only** — passing tests are counted, not listed
-5. **Stack trace pruning** — `site-packages`, `node_modules`, `_pytest`, `pluggy`, `asyncio`, `threading` frames hidden
-6. **Rule grouping** — lint errors grouped by code with compact `[file:line, file:line, +N]` locations
-7. **Severity split** — biome shows `N errors, M warnings` separately; per-rule `[warn]` / `[info]` tags
-8. **Recursive noise filtering** — `tree` and `ls` skip entire `node_modules/.git/__pycache__/…` subtrees
-9. **IPv4+IPv6 port dedup** — `0.0.0.0:8080->80/tcp, [::]:8080->80/tcp` → `:8080`
-10. **Multi-reporter detection** — biome's 4 reporters (pretty/summary/github/json) handled with schema differences between Biome 1.x and 2.x (icons `⚠`/`!`, JSON `{secs,nanos}`/nanoseconds int, location shape)
-11. **TTY-aware wrapping** — `ls`/`tree`/`grep`/`rg`/`git`/`docker` skip optimization when stdout is piped (preserves `ls *.log | head | xargs cat` contract); override with `WRUN_FORCE_PIPE=1`
-12. **SIGPIPE handling** — `SIG_DFL` + `BrokenPipeError` trap so `wrun cmd | head` exits cleanly without tracebacks
-13. **Compact summary everywhere** — `exit:N | tool | count/status | duration`
-14. **Full output saved** — `~/.local/share/wrun/*.log`, auto-cleanup keeps last 20
+1. **Ultra-compact output** — default format uses `✓/✗tool summary` icons, `NF/total` for counts, `×N` for grouped lint rules, `↑↓` for container states; saves additional 3–8 percentage points over verbose format
+2. **ANSI stripping** — CSI, OSC 8 hyperlinks, OSC sequences (BEL/ST terminators), private mode
+3. **Path normalization** — relative to git root, worktree-aware, resolves `../../` traversals back to absolute when outside the project
+4. **Tool-specific parsers** — 19 parser classes, 24 registry entries counting aliases (mypy/ty → TscParser, ag → GrepRgParser, npm/pip/bundle → PackageInstallParser, etc.)
+5. **Failures only** — passing tests are counted, not listed
+6. **Stack trace pruning** — `site-packages`, `node_modules`, `_pytest`, `pluggy`, `asyncio`, `threading` frames hidden
+7. **Rule grouping** — lint errors grouped by code with compact `[file:line+N]` locations
+8. **Severity split** — biome shows `Ne Mw` separately; per-rule `[w]` / `[i]` tags
+9. **Log line deduplication** — repeated consecutive identical lines collapsed to `line xN` (threshold: 3+); applied to docker logs, kubectl logs
+10. **Recursive noise filtering** — `tree` and `ls` skip entire `node_modules/.git/__pycache__/…` subtrees
+11. **IPv4+IPv6 port dedup** — `0.0.0.0:8080->80/tcp, [::]:8080->80/tcp` → `:8080`
+12. **Multi-reporter detection** — biome's 4 reporters (pretty/summary/github/json) handled with schema differences between Biome 1.x and 2.x
+13. **TTY-aware wrapping** — `ls`/`tree`/`grep`/`rg`/`git`/`docker` skip optimization when stdout is piped; override with `WRUN_FORCE_PIPE=1`
+14. **SIGPIPE handling** — `SIG_DFL` + `BrokenPipeError` trap so `wrun cmd | head` exits cleanly without tracebacks
+15. **Adaptive passthrough** — pure path-list outputs (e.g. `git diff --name-only`) skip the meta line when it would add tokens with no value
+16. **Smart install detection** — GenericParser detects install/download patterns and applies ultra-aggressive compression (3 lines + tail)
+17. **Full output saved** — `~/.local/share/wrun/*.log`, auto-cleanup keeps last 20; `→path` pointer only when agent benefits from it
 
 ## How it works
 
@@ -474,14 +478,14 @@ detects tool: cmd-parts match → SINGLE_CMD_MAP / GIT_SUBCOMMANDS / DOCKER_SUBC
     ↓
 parser extracts: counts, failures with file:line, assertions, diagnostics, severity
     ↓
-formatter emits: `exit:N | tool | summary` + compact details + `full: path`
+formatter emits ultra-compact: `✗pytest 3F/11 0.3s` + `✗test_name@line: msg` + `→path`
     ↓
 agent receives minimal, parseable output; can jump directly to file:line locations
 ```
 
 No infinite recursion is possible: `subprocess.run([cmd, ...])` invokes the binary directly, not via the shell, so wrapper shell functions are not triggered from inside wrun.
 
-For shell pipelines like `ls *.log | head -1 | xargs cat`, the `_wrun_pipe_active` helper detects that stdout is not a TTY and skips wrapping, so downstream consumers see raw file paths instead of the optimized `exit:0 | ls | N entries` header. Diagnostic tools (pytest, ruff, biome, tsc, …) keep unconditional wrapping — their structured output benefits agents that capture via subprocess.
+For shell pipelines like `ls *.log | head -1 | xargs cat`, the `_wrun_pipe_active` helper detects that stdout is not a TTY and skips wrapping, so downstream consumers see raw file paths instead of the optimized `✓ls 2d 2f` header. Diagnostic tools (pytest, ruff, biome, tsc, …) keep unconditional wrapping — their structured output benefits agents that capture via subprocess.
 
 ## Requirements
 
