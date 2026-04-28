@@ -84,7 +84,7 @@ ANSI_RE = re.compile(
 )
 DECORATIVE_RE = re.compile(r"^[\s=\-_~*]{3,}\s*$")
 _TRUNCATION_RE = re.compile(r"\+\d+ more\b|\.\.\. \(\d+")
-PROGRESS_RE = re.compile(r"^\s*[\|/\\\-]\s|^\s*\d+%\s*[\|█▓▒░]|^\.{4,}$")
+PROGRESS_RE = re.compile(r"^\s*[\|/\\\-]\s|^\s*\d+%\s*[\|█▓▒░]|^\.{4,}(?:\s*\[?\s*\d+%\s*\]?)?\s*$")
 TIMESTAMP_ONLY_RE = re.compile(r"^\[?\d{4}[-/]\d{2}[-/]\d{2}[\sT]\d{2}:\d{2}:\d{2}[^\]]*\]?\s*$")
 
 DEFAULT_MAX_FAILURES = 10

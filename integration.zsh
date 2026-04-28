@@ -235,6 +235,26 @@ tree() {
     if _wrun_pipe_active; then command wrun tree "$@"; else command tree "$@"; fi
 }
 
+# ─── timeout wrapper ─────────────────────────────────────────────────────────
+# `timeout 180 uv run pytest` bypasses uv() because timeout uses execve,
+# not the shell, so the uv() function is never invoked.
+# Detect diagnostic subcommands anywhere in the arg list and route through wrun.
+
+timeout() {
+    if _wrun_active; then
+        local arg
+        for arg in "$@"; do
+            case "$arg" in
+                pytest|py.test|ruff|mypy|ty|tsc|biome|vitest|jest|make|kubectl)
+                    command wrun timeout "$@"
+                    return $?
+                    ;;
+            esac
+        done
+    fi
+    command timeout "$@"
+}
+
 # ─── Convenience aliases ────────────────────────────────────────────────────
 
 alias wrun-on='export WRUN_AUTO=1'
